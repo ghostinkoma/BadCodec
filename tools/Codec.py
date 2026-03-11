@@ -86,7 +86,7 @@ OP_MASTER_BLOCK_B   = 0x3C
 # ============================================================
 
 BLOCK_SIZE = 8
-VERSION    = 051   # v0.5.1.0
+VERSION    = 510   # protocol version (file format)
 
 # ============================================================
 
@@ -975,7 +975,7 @@ with Pool(ncpu) as pool:
             p_rat  = curr_c / total_f
 
             sys.stdout.write('\033[H')
-            print(f"{C_BOLD}BadCodec v5.0.0 Encoder{C_RESET}"
+            print(f"{C_BOLD}BadCodec v0.5.1 Encoder{C_RESET}"
                   f"  [{ncpu} cores]  Phase 1/2: Encoding")
             print(_bar_block(p_rat))
             print(f"Frame: {write_ptr:04d} | "
@@ -996,7 +996,7 @@ with Pool(ncpu) as pool:
 #   この処理は全フレームが確定してからでないと正確に行えない。
 # -------------------------------------------------------
 sys.stdout.write('\033[H')
-print(f"{C_BOLD}BadCodec v5.0.0 Encoder{C_RESET}"
+print(f"{C_BOLD}BadCodec v0.5.1 Encoder{C_RESET}"
       f"  [{ncpu} cores]  Phase 2/2: Frame FOR merge...")
 print()
 
@@ -1056,7 +1056,7 @@ ncpu = cpu_count()
 os.makedirs(args.path, exist_ok=True)
 
 print(f"\033[2J\033[H", end="")
-print(f"{C_BOLD}BadCodec v5.0.0 Decoder{C_RESET}")
+print(f"{C_BOLD}BadCodec v0.5.1 Decoder{C_RESET}")
 print(f"Input : {args.input}")
 print(f"Output: {os.path.join(args.path, args.suffix)}%04d.bmp")
 print(f"Frames: {total_f}  Size: {w}×{h}")
@@ -1090,7 +1090,7 @@ for i, fdata in enumerate(frame_slices):
 
     p_rat = (i + 1) / total_f
     sys.stdout.write('\033[H')
-    print(f"{C_BOLD}BadCodec v5.0.0 Decoder{C_RESET}"
+    print(f"{C_BOLD}BadCodec v0.5.1 Decoder{C_RESET}"
           f"  [{ncpu} cores available]")
     print(_bar_block(p_rat))
     print(f"Frame: {frame_no:04d} / {st_i + total_f - 1} | "
@@ -1108,7 +1108,7 @@ print(f"\n{C_BOLD}Decode Complete.{C_RESET}"
 # ============================================================
 
 def main():
-p = argparse.ArgumentParser(description=“BadCodec v5.0.0”)
+p = argparse.ArgumentParser(description=“BadCodec v0.5.1”)
 p.add_argument(’-t’, ‘–task’,   choices=[‘e’,‘d’], required=True,
 help=“e=encode  d=decode”)
 p.add_argument(’-p’, ‘–path’,   required=True,
