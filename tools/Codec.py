@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 “””
-BadCodec v0.5.0.0
+BadCodec v0.5.1
+Based on BadCodec 完全実装仕様書 rev.11
+
+- MD5 -> Fletcher-16 に変更（マイコン向け最低解）
 
 Usage:
 Encode: python badcodec.py -t e -p ./frames -n frame_ -s 0001 -e 6572 -o output.bad
@@ -12,7 +15,6 @@ import sys
 import time
 import argparse
 import struct
-import hashlib
 import numpy as np
 from PIL import Image
 from collections import deque
@@ -84,7 +86,80 @@ OP_MASTER_BLOCK_B   = 0x3C
 # ============================================================
 
 BLOCK_SIZE = 8
-VERSION    = 500
+VERSION    = 051   # v0.5.1.0
+
+# ============================================================
+
+# Fletcher-16  (仕様書 3-3節)
+
+# マイコン向け最低解チェックサム
+
+# s1 = Σ data[i]      (mod 256)
+
+# s2 = Σ s1           (mod 256)
+
+# 格納値 = (s2 << 8) | s1  リトルエンディアン2バイト
+
+# 
+
+# コード量 : 数十バイト（MD5の1/20）
+
+# RAM      : 2バイト（MD5の1/32）
+
+# テーブル : 不要
+
+# 8bit演算 : 加算のみで完結
+
+# ============================================================
+
+def fletcher16(data: bytes) -> int:
+s1, s2 = 0, 0
+for b in data:
+s1 = (s1 + b) & 0xFF
+s2 = (s2 + s1) & 0xFF
+return (s2 << 8) | s1
+
+# ============================================================
+
+# Header  (仕様書 第3章)
+
+# [2: hdr_size] [2: Fletcher-16] [3: “Bad”] [2: ver] [2: colors]
+
+# [2: w] [2: h] [2: blksize] [2: total_frames]
+
+# ヘッダー全体サイズ: 2 + 2 + 15 = 19バイト固定
+
+# ============================================================
+
+def encode_header(w, h, total_frames):
+body = bytearray()
+body.extend(b’Bad’)
+body.extend(struct.pack(’<HHHHHH’, VERSION, 2, w, h, BLOCK_SIZE, total_frames))
+chk  = fletcher16(bytes(body))
+size = 2 + 2 + len(body)   # hdr_size(2) + Fletcher-16(2) + body(15)
+out  = bytearray()
+out.extend(struct.pack(’<H’, size))
+out.extend(struct.pack(’<H’, chk))
+out.extend(body)
+return bytes(out)
+
+def decode_header(data):
+“”“Returns (w, h, block_size, total_frames, hdr_size) or raises ValueError.”””
+if len(data) < 4:
+raise ValueError(“File too short for header.”)
+hdr_size   = struct.unpack(’<H’, data[0:2])[0]
+stored_chk = struct.unpack(’<H’, data[2:4])[0]
+body       = data[4:hdr_size]
+calc_chk   = fletcher16(bytes(body))
+if stored_chk != calc_chk:
+raise ValueError(
+f”Fletcher-16 Mismatch! “
+f”stored=0x{stored_chk:04X} calc=0x{calc_chk:04X} “
+f”File may be corrupted.”)
+if body[:3] != b’Bad’:
+raise ValueError(f”Invalid magic number: {body[:3]}”)
+_ver, _colors, w, h, blk, total_f = struct.unpack(’<HHHHHH’, body[3:15])
+return w, h, blk, total_f, hdr_size
 
 # ============================================================
 
@@ -149,42 +224,6 @@ r1 = ((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2)
 r2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)
 r3 = (b2 >> 2) & 0x3F
 return [r0, r1, r2, r3]
-
-# ============================================================
-
-# Header  (仕様書 第3章)
-
-# [2: hdr_size] [16: MD5] [3: “Bad”] [2: ver] [2: colors]
-
-# [2: w] [2: h] [2: blksize] [2: total_frames]
-
-# ============================================================
-
-def encode_header(w, h, total_frames):
-body = bytearray()
-body.extend(b’Bad’)
-body.extend(struct.pack(’<HHHHHH’, VERSION, 2, w, h, BLOCK_SIZE, total_frames))
-md5  = hashlib.md5(bytes(body)).digest()
-size = 2 + 16 + len(body)
-out  = bytearray()
-out.extend(struct.pack(’<H’, size))
-out.extend(md5)
-out.extend(body)
-return bytes(out)
-
-def decode_header(data):
-“”“Returns (w, h, block_size, total_frames, hdr_size) or raises ValueError.”””
-if len(data) < 18:
-raise ValueError(“File too short for header.”)
-hdr_size   = struct.unpack(’<H’, data[0:2])[0]
-stored_md5 = data[2:18]
-body       = data[18:hdr_size]
-if hashlib.md5(bytes(body)).digest() != stored_md5:
-raise ValueError(“MD5 Mismatch! File may be corrupted.”)
-if body[:3] != b’Bad’:
-raise ValueError(f”Invalid magic number: {body[:3]}”)
-_ver, _colors, w, h, blk, total_f = struct.unpack(’<HHHHHH’, body[3:15])
-return w, h, blk, total_f, hdr_size
 
 # ============================================================
 
