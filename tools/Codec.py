@@ -322,7 +322,7 @@ if np.array_equal(curr_b, prev_b):
 if np.array_equal(curr_b, 1 - prev_b):
     candidates.append((bytes([0x00]), 'I'))
 
-# 4. SHIFT_BIT  (1 byte) — try all ±3 combinations
+# 4. SHIFT_BIT  (1 byte) -- try all ±3 combinations
 for sx in range(-3, 4):
     for sy in range(-3, 4):
         if sx == 0 and sy == 0:
@@ -344,7 +344,7 @@ rle = _try_rle(curr_b)
 if rle is not None:
     candidates.append((bytes([rle[0]]) + rle[1], 'R'))
 
-# 6. MASTER_BLOCK  (9 bytes: opcode + 8) — always available
+# 6. MASTER_BLOCK  (9 bytes: opcode + 8) -- always available
 candidates.append((_encode_master_block(curr_b), 'M'))
 
 return min(candidates, key=lambda c: len(c[0]))
@@ -601,7 +601,7 @@ def do_block(cmd, b_i, p):
         curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = apply_shift(pb, sx, sy)
         return b_i + 1, p
 
-    # Unknown — skip 1 block
+    # Unknown -- skip 1 block
     return b_i + 1, p
 
 while b_idx < n_blk and ptr < len(stream):
