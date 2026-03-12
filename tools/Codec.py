@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
 “””
 BadCodec v0.5.1
 Based on BadCodec 完全実装仕様書 rev.11
 
-- MD5 -> Fletcher-16 に変更（マイコン向け最低解）
+- MD5 -> Fletcher-16 に変更(マイコン向け最低解)
 
 Usage:
 Encode: python badcodec.py -t e -p ./frames -n frame_ -s 0001 -e 6572 -o output.bad
@@ -102,9 +105,9 @@ VERSION    = 510   # protocol version (file format)
 
 # 
 
-# コード量 : 数十バイト（MD5の1/20）
+# コード量 : 数十バイト(MD5の1/20)
 
-# RAM      : 2バイト（MD5の1/32）
+# RAM      : 2バイト(MD5の1/32)
 
 # テーブル : 不要
 
@@ -837,7 +840,7 @@ return lines
 
 # 
 
-# FOR 禁止：FOR 0（2回）・FOR 1（3回） → N≦3 は個別に書く
+# FOR 禁止：FOR 0(2回)・FOR 1(3回) → N≦3 は個別に書く
 
 # FOR 上限：65回 → 65を超える場合は次のFORブロックに分割
 
@@ -871,7 +874,7 @@ while i < n:
     if len(data) == 1 and data[0] in SINGLE_BYTE_FRAME_OPS:
         op = data[0]
 
-        # 連続する同じ命令を数える（FOR上限65まで）
+        # 連続する同じ命令を数える(FOR上限65まで)
         j = i + 1
         while (j < n
                and len(ordered_frames[j][0]) == 1
