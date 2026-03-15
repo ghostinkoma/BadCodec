@@ -33,14 +33,15 @@ C_RESET   = “\033[0m”
 C_BOLD    = “\033[1m”
 C_GREEN   = “\033[92m”   # S: Skip
 C_WHITE   = “\033[97m”   # F: Fill
-C_YELLOW  = “\033[33m”   # R: RLE
+C_YELLOW  = “\033[33m”   # R: RLE (4-run and 8-run)
 C_CYAN    = “\033[36m”   # X: Shift
 C_RED     = “\033[91m”   # M: Master
 C_MAGENTA = “\033[35m”   # I: Invert
+C_BLUE    = “\033[94m”   # D: XOR Diff
 
 TYPE_COLOR = {
 ‘S’: C_GREEN, ‘F’: C_WHITE, ‘R’: C_YELLOW,
-‘X’: C_CYAN,  ‘M’: C_RED,   ‘I’: C_MAGENTA,
+‘X’: C_CYAN,  ‘M’: C_RED,   ‘I’: C_MAGENTA, ‘D’: C_BLUE,
 }
 
 # ============================================================
@@ -65,22 +66,48 @@ TYPE_COLOR = {
 
 # 0xC0-0xFF : FOR            (11nnnnnn)
 
-# — Frame-level (FRAME_CONTROL / special) —
+# — Frame-level opcodes (0x38-0x3F + 0x30) —
 
-OP_BLOCK_STREAM     = 0x30   # ※ frame context では BLOCK_STREAM として扱う
+OP_RLE_FRAME        = 0x30   # フレーム全体 RLE 8パターン (rev.12)
+OP_DELTA_FRAME      = 0x3D   # XOR差分フレーム + RLE 8パターン (rev.16)
+# curr XOR prev を RLE_FRAME と同形式で格納
 OP_FRAME_DELIMITER  = 0x38
 OP_SKIP_FRAME       = 0x39
 OP_FRAME_FILL_BLACK = 0x3A
 OP_FRAME_FILL_WHITE = 0x3B
-OP_MASTER_BLOCK_F   = 0x3C
-OP_RLE_FRAME        = 0x3D
+OP_BLOCK_STREAM     = 0x3C   # ブロック命令列開始 (rev.12)
 OP_MASTER_FRAME     = 0x3E
 OP_INVERT_PREV      = 0x3F
-OP_EXT_PREFIX       = 0xFF   # 拡張命令プレフィックス
+OP_EXT_PREFIX       = 0xFF
 
-# Block-level MASTER_BLOCK opcode (FRAME_CONTROL range 内)
+# Block-level opcodes
 
-OP_MASTER_BLOCK_B   = 0x3C
+OP_MASTER_BLOCK_B   = 0x3C   # ブロックコンテキスト内の MASTER_BLOCK
+OP_XOR_BLOCK_B      = 0x3F   # ブロックコンテキスト内の XOR_BLOCK
+
+# RLE_BLOCK_8 opcode table (block context, FRAME_CONTROL free slots)
+
+# (opcode, SCAN_PATHS index, start_color)
+
+# 0x38-0x3B: H scan top-start  0x3D-0x3E: V scan top-start
+
+# 0x3F: XOR_BLOCK (see below)
+
+RLE8_TABLE = [
+(0x38, 0, 0),   # H, TL(left), black-first
+(0x39, 0, 1),   # H, TL(left), white-first
+(0x3A, 1, 0),   # H, TR(right), black-first
+(0x3B, 1, 1),   # H, TR(right), white-first
+(0x3D, 4, 0),   # V, TL(top), black-first
+(0x3E, 4, 1),   # V, TL(top), white-first
+]
+RLE8_OPCODES = frozenset(op for op, _, _ in RLE8_TABLE)
+
+# XOR_BLOCK: block context only (0x3F)
+
+# Frame context: 0x3F = INVERT_PREV_FRAME (no conflict)
+
+OP_XOR_BLOCK_B = 0x3F
 
 # ============================================================
 
@@ -89,7 +116,7 @@ OP_MASTER_BLOCK_B   = 0x3C
 # ============================================================
 
 BLOCK_SIZE = 8
-VERSION    = 510   # protocol version (file format)
+VERSION    = 514   # protocol version rev.16: DELTA_FRAME + full candidate comparison
 
 # ============================================================
 
@@ -230,6 +257,37 @@ return [r0, r1, r2, r3]
 
 # ============================================================
 
+# RLE_BLOCK_8 bit-pack / unpack  (仕様書 6-6節)
+
+# 6bit × 8 runs → 6 bytes  (3バイトパックを2回繰り返す構造)
+
+# ============================================================
+
+def pack_rle8(runs):
+r = (list(runs) + [0]*8)[:8]
+r = [int(x) & 0x3F for x in r]
+b0 = r[0] | ((r[1] & 0x03) << 6)
+b1 = ((r[1] >> 2) & 0x0F) | ((r[2] & 0x0F) << 4)
+b2 = ((r[2] >> 4) & 0x03) | (r[3] << 2)
+b3 = r[4] | ((r[5] & 0x03) << 6)
+b4 = ((r[5] >> 2) & 0x0F) | ((r[6] & 0x0F) << 4)
+b5 = ((r[6] >> 4) & 0x03) | (r[7] << 2)
+return bytes([b0, b1, b2, b3, b4, b5])
+
+def unpack_rle8(data):
+b0,b1,b2,b3,b4,b5 = data[0],data[1],data[2],data[3],data[4],data[5]
+r0 = b0 & 0x3F
+r1 = ((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2)
+r2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)
+r3 = (b2 >> 2) & 0x3F
+r4 = b3 & 0x3F
+r5 = ((b3 >> 6) & 0x03) | ((b4 & 0x0F) << 2)
+r6 = ((b4 >> 4) & 0x0F) | ((b5 & 0x03) << 4)
+r7 = (b5 >> 2) & 0x3F
+return [r0, r1, r2, r3, r4, r5, r6, r7]
+
+# ============================================================
+
 # SHIFT_BIT helpers  (仕様書 6-3節)
 
 # ============================================================
@@ -303,51 +361,155 @@ def _encode_master_block(block):
 raw = np.packbits(block.flatten())
 return bytes([OP_MASTER_BLOCK_B]) + bytes(raw)  # 9 bytes total
 
+# ============================================================
+
+# RLE_BLOCK_8 encoder  (仕様書 6-6節)
+
+# _try_rle が失敗(5-8ランが必要)な場合のみ呼ばれる
+
+# ============================================================
+
+def _try_rle8(block):
+“””
+RLE8_TABLE の6パターンを試し, ランが 5-8 個に収まる最初の
+パターンを (opcode, bytes6) で返す。全て失敗なら None。
+“””
+for opcode, p_idx, start_col in RLE8_TABLE:
+path   = SCAN_PATHS[p_idx]
+pixels = block[path[:, 1], path[:, 0]]
+runs   = []
+curr   = start_col
+count  = 0
+valid  = True
+for px in pixels:
+if int(px) == curr:
+count += 1
+else:
+if count > 63:
+valid = False; break
+runs.append(count)
+curr  = 1 - curr
+count = 1
+if not valid:
+continue
+if count > 63:
+continue
+runs.append(count)
+if len(runs) > 8:
+continue
+return (opcode, pack_rle8(runs))
+return None
+
+# ============================================================
+
+# XOR_BLOCK encoder  (仕様書 6-8節)
+
+# curr と prev の XOR マスクを RLE エンコードして返す
+
+# ============================================================
+
+def _xor_block_rle(curr_b, prev_b):
+“””
+XOR マスク (64bit) を RLE エンコードして返す。
+形式: (color<<7 | run_length) の列, 1-63 ラン。
+“””
+xor_flat = (curr_b.astype(np.uint8) ^ prev_b.astype(np.uint8)).flatten()
+out = bytearray()
+i   = 0
+while i < 64:
+color = int(xor_flat[i])
+count = 1
+while i + count < 64 and int(xor_flat[i + count]) == color and count < 63:
+count += 1
+out.append((color << 7) | count)
+i += count
+return bytes(out)
+
 def encode_block(curr_b, prev_b):
 “””
-Encode one 8×8 block. Returns (bytes, type_char).
-All candidates are evaluated; smallest wins.
-“””
-candidates = []
+Encode one 8x8 block. Returns (bytes, type_char).
 
 ```
-# 1. FILL_BLOCK  (1 byte)
-if np.all(curr_b == 0):
-    candidates.append((bytes([0x30]), 'F'))   # FILL_BLACK ×1
-if np.all(curr_b == 1):
-    candidates.append((bytes([0x34]), 'F'))   # FILL_WHITE ×1
+Priority design:
+  Phase-1: 1-byte instructions (S / X / F / I)
+           If any match is found here, RLE and MASTER are
+           never computed.  This is the critical early-exit.
+  Phase-2: RLE_BLOCK (4 bytes) -- only reached when Phase-1 misses
+  Phase-3: MASTER_BLOCK (9 bytes) -- unconditional fallback
 
-# 2. SKIP_BLOCK  (1 byte)
+Tie-break within same byte-length: S > X > F > I > R > M
+This order maximises FOR-merge opportunities for SKIP runs.
+"""
+# ---- Phase-1: 1-byte candidates ---------------------------
+one_byte = []   # (bytes, type_char)
+
+# SKIP_BLOCK: prev との完全一致 (最優先 = FOR merge に最も効く)
 if np.array_equal(curr_b, prev_b):
-    candidates.append((bytes([0x80]), 'S'))
+    one_byte.append((bytes([0x80]), 'S'))
 
-# 3. BLOCK_INVERT  (1 byte)
-if np.array_equal(curr_b, 1 - prev_b):
-    candidates.append((bytes([0x00]), 'I'))
-
-# 4. SHIFT_BIT  (1 byte) -- try all ±3 combinations
-for sx in range(-3, 4):
-    for sy in range(-3, 4):
-        if sx == 0 and sy == 0:
-            continue
-        if np.array_equal(apply_shift(prev_b, sx, sy), curr_b):
-            sign_x = 1 if sx < 0 else 0
-            mag_x  = abs(sx)
-            sign_y = 1 if sy < 0 else 0
-            mag_y  = abs(sy)
-            op = 0x40 | (sign_x << 5) | (mag_x << 3) | (sign_y << 2) | mag_y
-            candidates.append((bytes([op]), 'X'))
+# SHIFT_BIT: prev を ±3 ドットシフトして一致
+# 1ピクセル移動から先に試す (小移動ほど映像的に頻出)
+if not one_byte:          # SKIP が見つかれば SHIFT 探索を省略
+    for dist in range(1, 4):          # 移動量 1 → 2 → 3 の順
+        found = False
+        for sx in range(-dist, dist + 1):
+            for sy in range(-dist, dist + 1):
+                if abs(sx) != dist and abs(sy) != dist:
+                    continue          # この dist の外周のみ試す
+                if sx == 0 and sy == 0:
+                    continue
+                if np.array_equal(apply_shift(prev_b, sx, sy), curr_b):
+                    sign_x = 1 if sx < 0 else 0
+                    mag_x  = abs(sx)
+                    sign_y = 1 if sy < 0 else 0
+                    mag_y  = abs(sy)
+                    op = 0x40 | (sign_x << 5) | (mag_x << 3) \
+                              | (sign_y << 2) | mag_y
+                    one_byte.append((bytes([op]), 'X'))
+                    found = True
+                    break
+            if found:
+                break
+        if found:
             break
-    else:
-        continue
-    break
 
-# 5. RLE_BLOCK  (4 bytes: opcode + 3)
-rle = _try_rle(curr_b)
-if rle is not None:
-    candidates.append((bytes([rle[0]]) + rle[1], 'R'))
+# FILL_BLOCK: 全黒 / 全白
+if np.all(curr_b == 0):
+    one_byte.append((bytes([0x30]), 'F'))   # FILL_BLACK x1
+elif np.all(curr_b == 1):
+    one_byte.append((bytes([0x34]), 'F'))   # FILL_WHITE x1
 
-# 6. MASTER_BLOCK  (9 bytes: opcode + 8) -- always available
+# BLOCK_INVERT: prev の完全反転
+if not one_byte and np.array_equal(curr_b, 1 - prev_b):
+    one_byte.append((bytes([0x00]), 'I'))
+
+# --- Early exit: 1バイト命令が1つでも見つかれば即返す -------
+if one_byte:
+    return one_byte[0]
+
+# ---- Phase-2: 複数バイト候補を全試算・最小採用 ---------------
+candidates = []
+
+# RLE_BLOCK_4 (4B)
+rle4 = _try_rle(curr_b)
+if rle4 is not None:
+    candidates.append((bytes([rle4[0]]) + rle4[1], 'R'))
+
+# XOR_BLOCK (2+N B) : opcode(1) + length(1) + RLE(N)
+# N < 7 の場合のみ MASTER_BLOCK(9B) より有利
+xor_rle = _xor_block_rle(curr_b, prev_b)
+xor_total = 2 + len(xor_rle)
+if xor_total < 9:
+    candidates.append((bytes([OP_XOR_BLOCK_B, len(xor_rle)]) + xor_rle, 'D'))
+
+# RLE_BLOCK_8 (7B) : RLE_4 が失敗した場合のみ試算
+# (4B < 7B なので RLE_4 が成功していれば RLE_8 は不要)
+if rle4 is None:
+    rle8 = _try_rle8(curr_b)
+    if rle8 is not None:
+        candidates.append((bytes([rle8[0]]) + rle8[1], 'R'))
+
+# MASTER_BLOCK (9B) : 無条件フォールバック
 candidates.append((_encode_master_block(curr_b), 'M'))
 
 return min(candidates, key=lambda c: len(c[0]))
@@ -359,6 +521,90 @@ return min(candidates, key=lambda c: len(c[0]))
 
 # ============================================================
 
+def _best_for_skip(N, base_op, max_inner, max_for=65):
+“””
+N ブロックのランを FOR(n)+CMD(i) + 余り で最小バイト数にエンコードする。
+
+```
+引数:
+  N        : エンコードすべきブロック数
+  base_op  : 命令のベースオペコード (SKIP=0x80, FILL_BLACK=0x30 等)
+  max_inner: 命令1回あたりの最大ブロック数 (SKIP=64, INVERT=32, FILL=4)
+  max_for  : FOR の最大繰り返し数 (仕様上 65)
+
+返値: bytearray
+
+アルゴリズム:
+  全 i (1..max_inner) について
+    n = N // i  をベースに n-1,n,n+1 を候補として探索
+    FOR生成禁止: n < 2 は直書き, n > max_for はクランプ
+    余り r = N - n*i を再帰的にエンコード
+  最小バイト数の (n,i,r) を採用する。
+"""
+if N <= 0:
+    return bytearray()
+
+# ---- 素直な直書き (FOR なし) をベースラインとして計算 ----
+def naive_bytes(n):
+    """n ブロックを FOR なしで直書きしたバイト数"""
+    if n <= 0: return 0
+    count = 0
+    rem = n
+    while rem > 0:
+        take = min(rem, max_inner)
+        count += 1
+        rem -= take
+    return count
+
+best_cost = naive_bytes(N)
+best_buf  = None
+
+# ---- FOR(n) + CMD(i) の全候補を探索 --------------------
+for i in range(1, max_inner + 1):
+    # N / i の前後を候補とする
+    for n_cand in (N // i, N // i + 1):
+        if n_cand < 2:
+            continue                     # FOR 0,1 は禁止 (2回未満)
+        n = min(n_cand, max_for)         # FOR 上限クランプ
+        product = n * i
+        if product > N:
+            continue
+        remainder = N - product
+
+        # コスト = 2 (FOR+CMD) + 余りの直書きコスト
+        cost = 2 + naive_bytes(remainder)
+        if cost < best_cost:
+            best_cost = cost
+            best_buf  = (n, i, remainder)
+
+# ---- エンコード出力生成 ---------------------------------
+out = bytearray()
+if best_buf is None:
+    # FOR なし直書き
+    rem = N
+    while rem > 0:
+        take = min(rem, max_inner)
+        out.append(base_op | (take - 1))
+        rem -= take
+else:
+    n, i, remainder = best_buf
+    for_byte  = 0xC0 | (n - 2)
+    inner_op  = base_op | (i - 1)
+    out.extend([for_byte, inner_op])
+    # 余りを再帰的にエンコード（余りは必ず N より小さい）
+    out.extend(_best_for_skip(remainder, base_op, max_inner, max_for))
+
+return out
+```
+
+# ============================================================
+
+# Multi-block merge  (SKIP / INVERT / FILL 連続をまとめる)
+
+# FOR(n)+CMD(i) 最適化を内包
+
+# ============================================================
+
 def _merge_multiblock(raw_cmds, raw_types):
 result_c, result_t = [], []
 i = 0
@@ -367,45 +613,43 @@ t = raw_types[i]
 c = raw_cmds[i]
 
 ```
+    # ---- SKIP_BLOCK ランを集約 -------------------------
     if t == 'S' and c == bytes([0x80]):
         j = i
         while j < len(raw_cmds) and raw_types[j] == 'S' \
                 and raw_cmds[j] == bytes([0x80]):
             j += 1
-        rem = j - i
-        while rem > 0:
-            n = min(rem, 64)
-            result_c.append(bytes([0x80 | (n - 1)]))
-            result_t.append('S')
-            rem -= n
+        N   = j - i
+        buf = _best_for_skip(N, 0x80, 64)
+        # FOR命令が含まれる場合は1トークンとして扱う
+        result_c.append(bytes(buf))
+        result_t.append('S')
         i = j
 
+    # ---- BLOCK_INVERT ランを集約 -----------------------
     elif t == 'I' and c == bytes([0x00]):
         j = i
         while j < len(raw_cmds) and raw_types[j] == 'I' \
                 and raw_cmds[j] == bytes([0x00]):
             j += 1
-        rem = j - i
-        while rem > 0:
-            n = min(rem, 32)
-            result_c.append(bytes([0x00 | (n - 1)]))
-            result_t.append('I')
-            rem -= n
+        N   = j - i
+        buf = _best_for_skip(N, 0x00, 32)
+        result_c.append(bytes(buf))
+        result_t.append('I')
         i = j
 
+    # ---- FILL_BLOCK ランを集約 -------------------------
     elif t == 'F' and len(c) == 1:
-        base = c[0] & 0xFC   # mask off count bits
+        base = c[0] & 0xFC   # 色ビット保持、カウントビットを落とす
         j    = i
         while j < len(raw_cmds) and raw_types[j] == 'F' \
                 and len(raw_cmds[j]) == 1 \
                 and (raw_cmds[j][0] & 0xFC) == base:
             j += 1
-        rem = j - i
-        while rem > 0:
-            n = min(rem, 4)
-            result_c.append(bytes([base | (n - 1)]))
-            result_t.append('F')
-            rem -= n
+        N   = j - i
+        buf = _best_for_skip(N, base, 4)
+        result_c.append(bytes(buf))
+        result_t.append('F')
         i = j
 
     else:
@@ -420,12 +664,18 @@ return result_c, result_t
 
 # FOR optimizer  (仕様書 9-2節)
 
+# S/F/I ランは _merge_multiblock が既に FOR 最適化済み。
+
+# ここでは RLE/SHIFT 等の残余の単一バイト命令ランに FOR を適用する。
+
 # ============================================================
 
 def optimize_for(cmds, types):
 “””
 Merge consecutive identical single-byte commands using FOR.
-FOR 0 (2×) and FOR 1 (3×) are forbidden → write literally.
+S/F/I multi-byte tokens (already FOR-optimized by _merge_multiblock)
+are passed through as-is.
+FOR 0 (2x) and FOR 1 (3x) are forbidden -> write literally.
 “””
 out_b = bytearray()
 out_t = []
@@ -433,15 +683,17 @@ i     = 0
 while i < len(cmds):
 cmd = cmds[i]
 t   = types[i]
+# マルチバイトトークン (S/F/I の FOR 最適化済みバイト列) はそのまま通過
 if len(cmd) != 1:
 out_b.extend(cmd)
 out_t.append(t)
 i += 1
 continue
+# 単一バイト命令の連続を FOR でまとめる (RLE/SHIFT/MASTER 等)
 j = i + 1
 while j < len(cmds) and cmds[j] == cmd and len(cmds[j]) == 1:
 j += 1
-n = j - i
+n   = j - i
 rem = n
 while rem > 0:
 if rem <= 3:
@@ -450,7 +702,7 @@ out_b.extend(cmd)
 out_t.append(t)
 rem = 0
 else:
-take = min(rem, 65)
+take     = min(rem, 65)
 for_byte = 0xC0 | (take - 2)
 out_b.extend([for_byte, cmd[0]])
 out_t.append(t)
@@ -460,22 +712,73 @@ return bytes(out_b), out_t
 
 # ============================================================
 
-# RLE_FRAME encoder  (仕様書 第7章)
+# RLE_FRAME encoder / decoder  (仕様書 第7章)
+
+# 
+
+# オペコード 0x30-0x37 = 8走査パターン
+
+# bit2 : 走査方向  (0=横優先, 1=縦優先)
+
+# bit1 : 開始Y     (0=y=0,    1=y=height_max)
+
+# bit0 : 開始X     (0=x=0,    1=x=width_max)
+
+# 
+
+# エンコード時に全8パターンを試算し最小バイト数を採用する。
 
 # ============================================================
 
-def encode_rle_frame(frame_2d):
-pixels = frame_2d.flatten().tolist()
-out    = bytearray()
+def _rle_scan_pixels(frame, scan_dir, start_y, start_x):
+“””
+フレームを指定走査パターンで1次元化して返す (numpy 版)。
+flip + 転置の組み合わせで8パターンを O(1) で生成。
+“””
+f = frame
+if start_x: f = f[:, ::-1]   # 水平反転
+if start_y: f = f[::-1, :]   # 垂直反転
+if scan_dir: f = f.T          # 縦優先は転置 (h,w) -> (w,h)
+return f.flatten()
+
+def _rle_encode_pixels(pixels):
+“”“1次元ピクセル列を RLE バイト列に変換。”””
+out = bytearray()
 i = 0
-while i < len(pixels):
-color = pixels[i]
+n = len(pixels)
+while i < n:
+color = int(pixels[i])
 count = 1
-while i + count < len(pixels) and pixels[i + count] == color and count < 127:
+while i + count < n and int(pixels[i + count]) == color and count < 127:
 count += 1
 out.append((color << 7) | count)
 i += count
 return bytes(out)
+
+def encode_rle_frame_best(frame):
+“””
+8パターン全試算し最小バイト数の (opcode + rle_data) を返す。
+0x30 (横/TL) は旧 RLE_FRAME と同一なので後方互換を保つ。
+“””
+best_bytes = None
+best_op    = 0x30
+for scan_dir in range(2):
+for start_y in range(2):
+for start_x in range(2):
+op  = 0x30 | (scan_dir << 2) | (start_y << 1) | start_x
+pix = _rle_scan_pixels(frame, scan_dir, start_y, start_x)
+rle = _rle_encode_pixels(pix)
+if best_bytes is None or len(rle) < len(best_bytes):
+best_bytes = rle
+best_op    = op
+return bytes([best_op]) + best_bytes
+
+# 旧名互換エイリアス (decode_frame から呼ばれる)
+
+def encode_rle_frame(frame_2d):
+“”“シンプルな横/TL固定 (0x30)。テスト・後方互換用。”””
+pix = _rle_scan_pixels(frame_2d, 0, 0, 0)
+return _rle_encode_pixels(pix)
 
 # ============================================================
 
@@ -501,27 +804,65 @@ if op == OP_INVERT_PREV:
 if op == OP_MASTER_FRAME:
     bits = np.unpackbits(np.frombuffer(data[1:], dtype=np.uint8))[:w * h]
     return bits.reshape(h, w).astype(np.uint8)
-if op == OP_RLE_FRAME:
-    return _decode_rle_frame(data[1:], w, h)
+# RLE_FRAME: 0x30-0x37 (8走査パターン)
+if 0x30 <= op <= 0x37:
+    scan_dir = (op >> 2) & 1
+    start_y  = (op >> 1) & 1
+    start_x  =  op       & 1
+    return _decode_rle_frame(data[1:], w, h, scan_dir, start_y, start_x)
+# DELTA_FRAME: 0x3D  XOR差分 + RLE (rev.16)
+# data[0]=0x3D, data[1]=走査パターン(0x30-0x37と同形式), data[2:]=RLEデータ
+if op == OP_DELTA_FRAME:
+    pat      = data[1]
+    scan_dir = (pat >> 2) & 1
+    start_y  = (pat >> 1) & 1
+    start_x  =  pat       & 1
+    diff_f   = _decode_rle_frame(data[2:], w, h, scan_dir, start_y, start_x)
+    return (prev_f ^ diff_f).astype(np.uint8)
 if op == OP_BLOCK_STREAM:
     return _decode_block_stream(data[1:], prev_f, w, h, bx, n_blk)
 
 raise ValueError(f"Unknown frame opcode: 0x{op:02X}")
 ```
 
-def _decode_rle_frame(rle, w, h):
+def _decode_rle_frame(rle, w, h, scan_dir=0, start_y=0, start_x=0):
+“””
+RLE バイト列を走査パターンに従ってデコードし (h, w) フレームを返す。
+
+```
+エンコード時の変換:
+  1. start_x が 1 なら水平反転
+  2. start_y が 1 なら垂直反転
+  3. scan_dir が 1 なら転置 (縦優先)
+  4. flatten して RLE
+
+デコードは逆順で復元する。
+"""
 total  = w * h
 pixels = []
 for byte in rle:
-color  = (byte >> 7) & 1
-length = byte & 0x7F
-if length == 0:
-break
-pixels.extend([color] * length)
-if len(pixels) >= total:
-break
+    color  = (byte >> 7) & 1
+    length = byte & 0x7F
+    if length == 0:
+        break
+    pixels.extend([color] * length)
+    if len(pixels) >= total:
+        break
+
 arr = np.array(pixels[:total], dtype=np.uint8)
-return arr.reshape(h, w)
+
+# 逆変換: scan_dir=1 は転置状態なので (w,h) にリシェイプ後転置
+if scan_dir:
+    frame = arr.reshape(w, h).T   # (w,h) -> (h,w)
+else:
+    frame = arr.reshape(h, w)
+
+# flip を元に戻す (エンコードと逆順)
+if start_y: frame = frame[::-1, :]
+if start_x: frame = frame[:, ::-1]
+
+return frame.astype(np.uint8)
+```
 
 def _decode_block_stream(stream, prev_f, w, h, bx, n_blk):
 curr_f = np.zeros((h, w), dtype=np.uint8)
@@ -558,7 +899,7 @@ def do_block(cmd, b_i, p):
                     1 - prev_f[yy:yy+BLOCK_SIZE, xx:xx+BLOCK_SIZE]
         return b_i + cnt, p
 
-    # RLE_BLOCK
+    # RLE_BLOCK_4 (4-run)
     if 0x20 <= cmd <= 0x2F:
         p_idx     = (cmd >> 1) & 0x07
         start_col = cmd & 0x01
@@ -569,9 +910,10 @@ def do_block(cmd, b_i, p):
         for r in runs:
             pix.extend([col] * r)
             col = 1 - col
-        blk = np.zeros(64, dtype=np.uint8)
-        blk[:min(64, len(pix))] = pix[:64]
-        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = blk.reshape(BLOCK_SIZE, BLOCK_SIZE)
+        blk = np.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=np.uint8)
+        for idx, v in enumerate(pix[:64]):
+            blk[path[idx, 1], path[idx, 0]] = v   # path[i]=(x,y) → blk[y,x]
+        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = blk
         return b_i + 1, p + 3
 
     # FILL_BLOCK
@@ -585,12 +927,44 @@ def do_block(cmd, b_i, p):
                 curr_f[yy:yy+BLOCK_SIZE, xx:xx+BLOCK_SIZE] = color
         return b_i + cnt, p
 
+    # RLE_BLOCK_8 (8-run, 6 data bytes)
+    if cmd in RLE8_OPCODES:
+        entry = next(e for e in RLE8_TABLE if e[0] == cmd)
+        _, p_idx, start_col = entry
+        runs  = unpack_rle8(stream[p:p+6])
+        path  = SCAN_PATHS[p_idx]
+        pix   = []
+        col   = start_col
+        for r in runs:
+            pix.extend([col] * r)
+            col = 1 - col
+        blk = np.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=np.uint8)
+        for idx, v in enumerate(pix[:64]):
+            blk[path[idx, 1], path[idx, 0]] = v   # path[i]=(x,y) → blk[y,x]
+        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = blk
+        return b_i + 1, p + 6
+
     # MASTER_BLOCK
     if cmd == OP_MASTER_BLOCK_B:
         bits = np.unpackbits(np.frombuffer(stream[p:p+8], dtype=np.uint8))
         curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = \
             bits.reshape(BLOCK_SIZE, BLOCK_SIZE)
         return b_i + 1, p + 8
+
+    # XOR_BLOCK (variable length: length_byte + RLE_data)
+    if cmd == OP_XOR_BLOCK_B:
+        xor_len = stream[p]; p += 1
+        xor_pix = []
+        j = p
+        while len(xor_pix) < 64 and j < p + xor_len:
+            b    = stream[j]; j += 1
+            col  = (b >> 7) & 1
+            run  = b & 0x7F
+            xor_pix.extend([col] * min(run, 64 - len(xor_pix)))
+        xor_mask = np.array(xor_pix[:64], dtype=np.uint8).reshape(BLOCK_SIZE, BLOCK_SIZE)
+        prev_blk = prev_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE]
+        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = (prev_blk ^ xor_mask).astype(np.uint8)
+        return b_i + 1, p + xor_len
 
     # SHIFT_BIT
     if 0x40 <= cmd <= 0x7F:
@@ -641,11 +1015,24 @@ return 1
 # MASTER_FRAME: 1 + w*h/8
 if op == OP_MASTER_FRAME:
 return 1 + (w * h) // 8
-# RLE_FRAME: read until pixel count reached
-if op == OP_RLE_FRAME:
+# RLE_FRAME: 0x30-0x37 (8走査パターン共通)
+if 0x30 <= op <= 0x37:
 total  = w * h
 count  = 0
 i      = offset + 1
+while count < total and i < len(data):
+byte   = data[i]
+length = byte & 0x7F
+if length == 0:
+i += 1; break
+count += length
+i     += 1
+return i - offset
+# DELTA_FRAME: 0x3D  opcode(1) + pattern(1) + RLEデータ(可変)
+if op == OP_DELTA_FRAME:
+total  = w * h
+count  = 0
+i      = offset + 2   # opcode + pattern
 while count < total and i < len(data):
 byte   = data[i]
 length = byte & 0x7F
@@ -676,6 +1063,13 @@ break
 b_idx += advance
 ptr   += extra
 continue
+# XOR_BLOCK: variable length (special case)
+if cmd == OP_XOR_BLOCK_B:
+if ptr < len(data):
+xor_len = data[ptr]; ptr += 1
+ptr += xor_len
+b_idx += 1
+continue
 b_idx += _block_advance(cmd)
 ptr   += _block_extra_bytes(cmd)
 return ptr - offset
@@ -683,18 +1077,22 @@ return 1
 
 def _block_advance(cmd):
 “”“How many blocks does this command consume?”””
-if cmd & 0x80:          return (cmd & 0x3F) + 1   # SKIP_BLOCK
-if cmd <= 0x1F:         return (cmd & 0x1F) + 1   # BLOCK_INVERT
-if 0x20 <= cmd <= 0x2F: return 1                   # RLE_BLOCK
-if 0x30 <= cmd <= 0x37: return (cmd & 0x03) + 1   # FILL_BLOCK
-if cmd == 0x3C:         return 1                   # MASTER_BLOCK
-if 0x40 <= cmd <= 0x7F: return 1                   # SHIFT_BIT
+if cmd & 0x80:              return (cmd & 0x3F) + 1   # SKIP_BLOCK
+if cmd <= 0x1F:             return (cmd & 0x1F) + 1   # BLOCK_INVERT
+if 0x20 <= cmd <= 0x2F:    return 1                    # RLE_BLOCK_4
+if 0x30 <= cmd <= 0x37:    return (cmd & 0x03) + 1    # FILL_BLOCK
+if cmd in RLE8_OPCODES:    return 1                    # RLE_BLOCK_8
+if cmd == OP_MASTER_BLOCK_B: return 1                  # MASTER_BLOCK
+# OP_XOR_BLOCK_B (0x3F) is variable-length; handled separately
+if 0x40 <= cmd <= 0x7F:    return 1                    # SHIFT_BIT
 return 1
 
 def _block_extra_bytes(cmd):
-“”“How many extra data bytes follow this command?”””
-if 0x20 <= cmd <= 0x2F: return 3   # RLE_BLOCK: 3 bytes
-if cmd == 0x3C:         return 8   # MASTER_BLOCK: 8 bytes
+“”“How many fixed extra data bytes follow this command? (variable-length handled separately)”””
+if 0x20 <= cmd <= 0x2F:    return 3   # RLE_BLOCK_4: 3 bytes
+if cmd in RLE8_OPCODES:    return 6   # RLE_BLOCK_8: 6 bytes
+if cmd == OP_MASTER_BLOCK_B: return 8  # MASTER_BLOCK: 8 bytes
+# OP_XOR_BLOCK_B (0x3F): variable, handled by frame_data_size directly
 return 0
 
 # ============================================================
@@ -745,9 +1143,19 @@ else:
 
 bx     = w // BLOCK_SIZE
 n_blk  = bx * (h // BLOCK_SIZE)
-raw_sz = (w * h) // 8
+raw_sz = (w * h) // 8          # MASTER_FRAME のデータ部固定サイズ
 
-# --- Frame-level single commands (候補D) ---
+# ==========================================================
+# 全候補を収集して最小バイト数を選ぶ
+# candidates: list of (encoded_bytes, type_list)
+# ==========================================================
+candidates = []
+
+# ----------------------------------------------------------
+# Phase-1: フレーム単一命令 (1B確定)
+# これらが1つでも成立すれば他の全候補に勝つ (1B < 2B)
+# 早期終了して計算コストを節約する
+# ----------------------------------------------------------
 if np.array_equal(curr_f, prev_f):
     return _self_verify(frame_idx, bytes([OP_SKIP_FRAME]),
                         ['S'] * n_blk, curr_f, prev_f, w, h)
@@ -761,7 +1169,40 @@ if np.array_equal(curr_f, 1 - prev_f):
     return _self_verify(frame_idx, bytes([OP_INVERT_PREV]),
                         ['I'] * n_blk, curr_f, prev_f, w, h)
 
-# --- Block-level encoding ---
+# ----------------------------------------------------------
+# Phase-2: 固定長候補を先に計算
+# MASTER_FRAME のサイズは固定 (raw_sz + 1) なので先に確定できる
+# これを上限として BLOCK_STREAM の採否を早期判定する
+# ----------------------------------------------------------
+
+# 候補C: MASTER_FRAME (固定長 raw_sz+1 B)
+cand_c = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(curr_f.flatten()))
+candidates.append((cand_c, ['M'] * n_blk))
+master_sz = len(cand_c)   # = raw_sz + 1
+
+# ----------------------------------------------------------
+# Phase-3: RLE系候補 (curr_f / diff_f の両方を試算)
+# BLOCK_STREAMより計算コストが低いので先に実施する
+# ----------------------------------------------------------
+
+# 候補B: RLE_FRAME (curr_f に対して8走査パターン全試算)
+cand_b = encode_rle_frame_best(curr_f)
+candidates.append((cand_b, ['R'] * n_blk))
+
+# 候補E: DELTA_FRAME (curr XOR prev を RLE_FRAME と同形式で格納)
+# フォーマット: OP_DELTA_FRAME(1B) + pattern(1B) + RLEデータ
+diff_f    = (curr_f ^ prev_f).astype(np.uint8)
+best_diff = encode_rle_frame_best(diff_f)   # (op + rle_data)
+# best_diff[0] は 0x30-0x37 なので pattern byte として再利用
+cand_e = bytes([OP_DELTA_FRAME, best_diff[0]]) + best_diff[1:]
+candidates.append((cand_e, ['D'] * n_blk))
+
+# ----------------------------------------------------------
+# Phase-4: BLOCK_STREAM
+# 全ブロックエンコードが必要で最も計算コストが高い
+# RLE/MASTERが既に十分小さい場合でも常に試算して正確に比較する
+# (エンコード時間より圧縮率を優先する設計)
+# ----------------------------------------------------------
 raw_cmds, raw_types = [], []
 for b in range(n_blk):
     y = (b // bx) * BLOCK_SIZE
@@ -775,25 +1216,18 @@ for b in range(n_blk):
 merged_c, merged_t   = _merge_multiblock(raw_cmds, raw_types)
 opt_bytes, opt_types = optimize_for(merged_c, merged_t)
 
-# Candidate A: BLOCK_STREAM
+# 候補A: BLOCK_STREAM
 cand_a = bytes([OP_BLOCK_STREAM]) + opt_bytes
+candidates.append((cand_a, opt_types))
 
-# Candidate B: RLE_FRAME
-rle_body = encode_rle_frame(curr_f)
-cand_b   = bytes([OP_RLE_FRAME]) + rle_body
+# ----------------------------------------------------------
+# 全候補から最小バイト数を採用
+# 同サイズの場合: A(BLOCK) > B(RLE) > C(MASTER) > E(DELTA)
+# の逆順でリストに入っているので先勝ちではなく len() で比較
+# ----------------------------------------------------------
+best_data, best_types = min(candidates, key=lambda x: len(x[0]))
 
-# Candidate C: MASTER_FRAME
-cand_c = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(curr_f.flatten()))
-
-best = min(
-    (cand_a, opt_types),
-    (cand_b, ['R'] * n_blk),
-    (cand_c, ['M'] * n_blk),
-    key=lambda x: len(x[0])
-)
-data, types = best
-
-return _self_verify(frame_idx, data, types, curr_f, prev_f, w, h)
+return _self_verify(frame_idx, best_data, best_types, curr_f, prev_f, w, h)
 ```
 
 # ============================================================
