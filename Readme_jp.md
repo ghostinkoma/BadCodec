@@ -2,7 +2,7 @@
 
 **8ビットマイコン向け2値モノクロ動画コーデック**
 
-[![Version](https://img.shields.io/badge/version-0.5.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.5-blue)](CHANGELOG.md)
 [![Protocol](https://img.shields.io/badge/protocol-514-lightgrey)](SPEC.md)
 [![License](https://img.shields.io/badge/license-Non--Commercial-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-pre--release-orange)]()
@@ -13,8 +13,8 @@
 
 ## 概要
 
-BadCodec は LGT8F328（RAM 2KB）等の極低スペックマイコン上で  
-モノクロ2値動画をリアルタイム再生するためのコーデックです。
+BadCodec は LGT8F328（RAM 2KB）等の極低スペックマイコン、
+ESP32などのマイコン上で動作モノクロ2値動画をリアルタイム再生するためのコーデックです。
 
 **設計思想：**
 
@@ -31,6 +31,7 @@ BadCodec は LGT8F328（RAM 2KB）等の極低スペックマイコン上で
 ## 実績圧縮率
 
 ```
+例:
 Bad Apple!! 128x64 / 6572フレーム / 2値モノクロ / ロスレス
 
   非圧縮     : 6.42 MB  (100%)
@@ -41,7 +42,6 @@ Bad Apple!! 128x64 / 6572フレーム / 2値モノクロ / ロスレス
   辞書圧縮なし (LZ77 / LZW 等 不使用)
   LGT8F328 (2KB RAM) でリアルタイムデコード可能
 
-この制約下での 1MB 未満達成は極めて稀。
 ```
 
 ---
@@ -194,7 +194,7 @@ void loop() {
 
 ```
 [済] コーデック仕様確定 (SPEC.md rev.18)
-[済] Python エンコーダ/デコーダ (Protocol 514)
+[済] Python エンコーダ/デコーダ (Protocol 055)
 [済] マルチCPU並列エンコード
 [済] Self-Verify 機構
 [済] Cデコーダ (bad_decode.h / bad_decode.cpp)
