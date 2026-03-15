@@ -1,7 +1,7 @@
 /**
  * @file    bad_decode.h
- * @brief   BadCodec v0.5.1 - Decoder for 8/32-bit MCU
- * @version 0.5.1  (Protocol: 514)
+ * @brief   BadCodec v0.5.5 - Decoder for 8/32-bit MCU
+ * @version 0.5.5  (Protocol: 055)
  * @date    2026-03-15
  * @license Non-Commercial Use Only  ghostinkoma@gmail.com
  *
