@@ -3,7 +3,7 @@
 **8ビットマイコン向け2値モノクロ動画コーデック**
 
 [![Version](https://img.shields.io/badge/version-0.5.5-blue)](CHANGELOG.md)
-[![Protocol](https://img.shields.io/badge/protocol-514-lightgrey)](SPEC.md)
+[![Protocol](https://img.shields.io/badge/protocol-055-lightgrey)](SPEC.md)
 [![License](https://img.shields.io/badge/license-Non--Commercial-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-pre--release-orange)]()
 
