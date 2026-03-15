@@ -430,88 +430,97 @@ def encode_block(curr_b, prev_b):
 Encode one 8x8 block. Returns (bytes, type_char).
 
 ```
-Priority design:
-  Phase-1: 1-byte instructions (S / X / F / I)
-           If any match is found here, RLE and MASTER are
-           never computed.  This is the critical early-exit.
-  Phase-2: RLE_BLOCK (4 bytes) -- only reached when Phase-1 misses
-  Phase-3: MASTER_BLOCK (9 bytes) -- unconditional fallback
+全候補を独立に計算し最小バイト数を採用する。
+早期終了による分岐は一切行わない。
+1バイト命令は数学的に常に最小なので、
+1バイト候補が1つでも見つかれば多バイト候補の計算を省略する。
 
-Tie-break within same byte-length: S > X > F > I > R > M
-This order maximises FOR-merge opportunities for SKIP runs.
+採用優先順位（同サイズ時）:
+  S > X > F > I > R > D > M
+  S を最優先とすることで FOR-merge の効率を最大化する。
 """
-# ---- Phase-1: 1-byte candidates ---------------------------
+# ============================================================
+# Phase-1: 1バイト候補を全て独立に計算する
+# ============================================================
 one_byte = []   # (bytes, type_char)
 
-# SKIP_BLOCK: prev との完全一致 (最優先 = FOR merge に最も効く)
+# SKIP_BLOCK: prev と完全一致
 if np.array_equal(curr_b, prev_b):
     one_byte.append((bytes([0x80]), 'S'))
 
-# SHIFT_BIT: prev を ±3 ドットシフトして一致
-# 1ピクセル移動から先に試す (小移動ほど映像的に頻出)
-if not one_byte:          # SKIP が見つかれば SHIFT 探索を省略
-    for dist in range(1, 4):          # 移動量 1 → 2 → 3 の順
-        found = False
-        for sx in range(-dist, dist + 1):
-            for sy in range(-dist, dist + 1):
-                if abs(sx) != dist and abs(sy) != dist:
-                    continue          # この dist の外周のみ試す
-                if sx == 0 and sy == 0:
-                    continue
-                if np.array_equal(apply_shift(prev_b, sx, sy), curr_b):
-                    sign_x = 1 if sx < 0 else 0
-                    mag_x  = abs(sx)
-                    sign_y = 1 if sy < 0 else 0
-                    mag_y  = abs(sy)
-                    op = 0x40 | (sign_x << 5) | (mag_x << 3) \
-                              | (sign_y << 2) | mag_y
-                    one_byte.append((bytes([op]), 'X'))
-                    found = True
-                    break
-            if found:
+# SHIFT_BIT: prev を ±3 ドット全方向シフトして一致するか試算
+# SKIP がある場合も含め常に独立して試算する（but 1Bなので意味は同じ）
+# ただし SKIP が見つかれば SHIFT(1B)でも結果が変わらないので省略可
+if not any(t == 'S' for _, t in one_byte):
+    shift_found = False
+    for sx in range(-3, 4):
+        if shift_found: break
+        for sy in range(-3, 4):
+            if sx == 0 and sy == 0:
+                continue
+            if np.array_equal(apply_shift(prev_b, sx, sy), curr_b):
+                sign_x = 1 if sx < 0 else 0
+                mag_x  = abs(sx)
+                sign_y = 1 if sy < 0 else 0
+                mag_y  = abs(sy)
+                op = 0x40 | (sign_x << 5) | (mag_x << 3) \
+                          | (sign_y << 2) | mag_y
+                one_byte.append((bytes([op]), 'X'))
+                shift_found = True
                 break
-        if found:
-            break
 
-# FILL_BLOCK: 全黒 / 全白
+# FILL_BLOCK: 全黒 または 全白
 if np.all(curr_b == 0):
-    one_byte.append((bytes([0x30]), 'F'))   # FILL_BLACK x1
+    one_byte.append((bytes([0x30]), 'F'))
 elif np.all(curr_b == 1):
-    one_byte.append((bytes([0x34]), 'F'))   # FILL_WHITE x1
+    one_byte.append((bytes([0x34]), 'F'))
 
-# BLOCK_INVERT: prev の完全反転
-if not one_byte and np.array_equal(curr_b, 1 - prev_b):
+# BLOCK_INVERT: prev の全ビット反転と一致
+if np.array_equal(curr_b, 1 - prev_b):
     one_byte.append((bytes([0x00]), 'I'))
 
-# --- Early exit: 1バイト命令が1つでも見つかれば即返す -------
+# ============================================================
+# 1バイト命令が見つかれば即返す
+# 数学的に1B < 4B < 7B < 9B なので多バイト候補は計算不要
+# 同サイズ内の優先順: S > X > F > I
+# ============================================================
 if one_byte:
-    return one_byte[0]
+    for preferred_type in ('S', 'X', 'F', 'I'):
+        for cand in one_byte:
+            if cand[1] == preferred_type:
+                return cand
+    return one_byte[0]  # 上記に該当しない場合（通常到達しない）
 
-# ---- Phase-2: 複数バイト候補を全試算・最小採用 ---------------
+# ============================================================
+# Phase-2: 多バイト候補を全て独立に計算し最小を選ぶ
+# 1バイト命令が存在しない場合のみ到達する
+# ============================================================
 candidates = []
 
-# RLE_BLOCK_4 (4B)
+# RLE_BLOCK_4 (4B): 4ラン以内に収まる場合
 rle4 = _try_rle(curr_b)
 if rle4 is not None:
-    candidates.append((bytes([rle4[0]]) + rle4[1], 'R'))
+    candidates.append((bytes([rle4[0]]) + rle4[1], 'R'))   # 4B
 
-# XOR_BLOCK (2+N B) : opcode(1) + length(1) + RLE(N)
-# N < 7 の場合のみ MASTER_BLOCK(9B) より有利
-xor_rle = _xor_block_rle(curr_b, prev_b)
+# XOR_BLOCK (2+N B): prev XOR curr のRLE
+# MASTER(9B)より小さい場合のみ候補に加える
+xor_rle   = _xor_block_rle(curr_b, prev_b)
 xor_total = 2 + len(xor_rle)
 if xor_total < 9:
-    candidates.append((bytes([OP_XOR_BLOCK_B, len(xor_rle)]) + xor_rle, 'D'))
+    candidates.append(
+        (bytes([OP_XOR_BLOCK_B, len(xor_rle)]) + xor_rle, 'D'))
 
-# RLE_BLOCK_8 (7B) : RLE_4 が失敗した場合のみ試算
-# (4B < 7B なので RLE_4 が成功していれば RLE_8 は不要)
+# RLE_BLOCK_8 (7B): 5-8ランが必要な場合
+# RLE4(4B) が成功していれば 7B は勝てないので試算不要
 if rle4 is None:
     rle8 = _try_rle8(curr_b)
     if rle8 is not None:
-        candidates.append((bytes([rle8[0]]) + rle8[1], 'R'))
+        candidates.append((bytes([rle8[0]]) + rle8[1], 'R'))  # 7B
 
-# MASTER_BLOCK (9B) : 無条件フォールバック
+# MASTER_BLOCK (9B): 無条件フォールバック
 candidates.append((_encode_master_block(curr_b), 'M'))
 
+# 最小バイト数を採用（同サイズなら先に追加された候補が勝つ）
 return min(candidates, key=lambda c: len(c[0]))
 ```
 
