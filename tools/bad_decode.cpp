@@ -1,1516 +1,749 @@
-#!/usr/bin/env python3
+/**
 
-# -*- coding: utf-8 -*-
+- @file    bad_decode.cpp
+- @brief   BadCodec v0.5.1 - Decoder implementation
+- @version 0.5.1  (Protocol: 513)
+- @date    2026-03-15
+- @license Non-Commercial Use Only  ghostinkoma@gmail.com
+- 
+- Design constraints:
+- - NO malloc / free
+- - NO floating point
+- - NO division
+- - Stack usage: max ~32 bytes per function (AVR safe)
+- - <stdint.h> only
+    */
 
-“””
-BadCodec v0.5.1
-Based on BadCodec 完全実装仕様書 rev.11
+#include “bad_decode.h”
 
-- MD5 -> Fletcher-16 に変更(マイコン向け最低解)
+/* ============================================================
 
-Usage:
-Encode: python badcodec.py -t e -p ./frames -n frame_ -s 0001 -e 6572 -o output.bad
-Decode: python badcodec.py -t d -i output.bad -p ./out  -n frame_ -s 0001
-“””
+- Internal: memset / memcpy  (no <string.h>)
+- ============================================================ */
 
-import os
-import sys
-import time
-import argparse
-import struct
-import numpy as np
-from PIL import Image
-from collections import deque
-from multiprocessing import Pool, cpu_count
-
-# ============================================================
-
-# ANSI Colors
-
-# ============================================================
-
-C_RESET   = “\033[0m”
-C_BOLD    = “\033[1m”
-C_GREEN   = “\033[92m”   # S: Skip
-C_WHITE   = “\033[97m”   # F: Fill
-C_YELLOW  = “\033[33m”   # R: RLE (4-run and 8-run)
-C_CYAN    = “\033[36m”   # X: Shift
-C_RED     = “\033[91m”   # M: Master
-C_MAGENTA = “\033[35m”   # I: Invert
-C_BLUE    = “\033[94m”   # D: XOR Diff
-
-TYPE_COLOR = {
-‘S’: C_GREEN, ‘F’: C_WHITE, ‘R’: C_YELLOW,
-‘X’: C_CYAN,  ‘M’: C_RED,   ‘I’: C_MAGENTA, ‘D’: C_BLUE,
+static void bad_memset(uint8_t *dst, uint8_t val, uint16_t len)
+{
+while (len–) { *dst++ = val; }
 }
 
-# ============================================================
-
-# Opcodes  (仕様書 第5章 bit tree より)
-
-# ============================================================
-
-# — Block-level —
-
-# 0x00-0x1F : BLOCK_INVERT   (000nnnnn)
-
-# 0x20-0x2F : RLE_BLOCK      (0010pppc)  pp=scan_pattern bit3-1, c=start_color
-
-# 0x30-0x37 : FILL_BLOCK     (00110cnn)  c=color, nn=count-1
-
-# 0x38-0x3F : FRAME_CONTROL  (00111xxx)  ※ block context では MASTER_BLOCK=0x3C のみ使用
-
-# 0x40-0x7F : SHIFT_BIT      (01sxxcyy)  s=sign_x, xx=mag_x, c=sign_y, yy=mag_y
-
-# 0x80-0xBF : SKIP_BLOCK     (10nnnnnn)
-
-# 0xC0-0xFF : FOR            (11nnnnnn)
-
-# — Frame-level opcodes (0x38-0x3F + 0x30) —
-
-OP_RLE_FRAME        = 0x30   # フレーム全体 RLE  (rev.12)
-OP_FRAME_DELIMITER  = 0x38
-OP_SKIP_FRAME       = 0x39
-OP_FRAME_FILL_BLACK = 0x3A
-OP_FRAME_FILL_WHITE = 0x3B
-OP_BLOCK_STREAM     = 0x3C   # ブロック命令列開始 (rev.12)
-
-# 0x3D = 空き
-
-OP_MASTER_FRAME     = 0x3E
-OP_INVERT_PREV      = 0x3F
-OP_EXT_PREFIX       = 0xFF
-
-# Block-level opcodes
-
-OP_MASTER_BLOCK_B   = 0x3C   # ブロックコンテキスト内の MASTER_BLOCK
-
-# RLE_BLOCK_8 opcode table (block context, FRAME_CONTROL free slots)
-
-# (opcode, SCAN_PATHS index, start_color)
-
-# 0x38-0x3B: H scan top-start  0x3D-0x3E: V scan top-start
-
-# 0x3F: XOR_BLOCK (see below)
-
-RLE8_TABLE = [
-(0x38, 0, 0),   # H, TL(left), black-first
-(0x39, 0, 1),   # H, TL(left), white-first
-(0x3A, 1, 0),   # H, TR(right), black-first
-(0x3B, 1, 1),   # H, TR(right), white-first
-(0x3D, 4, 0),   # V, TL(top), black-first
-(0x3E, 4, 1),   # V, TL(top), white-first
-]
-RLE8_OPCODES = frozenset(op for op, _, _ in RLE8_TABLE)
-
-# XOR_BLOCK: block context only (0x3F)
-
-# Frame context: 0x3F = INVERT_PREV_FRAME (no conflict)
-
-OP_XOR_BLOCK_B = 0x3F
-
-# ============================================================
-
-# Constants
-
-# ============================================================
-
-BLOCK_SIZE = 8
-VERSION    = 513   # protocol version (file format) rev.15: RLE_BLOCK_8 + XOR_BLOCK
-
-# ============================================================
-
-# Fletcher-16  (仕様書 3-3節)
-
-# マイコン向け最低解チェックサム
-
-# s1 = Σ data[i]      (mod 256)
-
-# s2 = Σ s1           (mod 256)
-
-# 格納値 = (s2 << 8) | s1  リトルエンディアン2バイト
-
-# 
-
-# コード量 : 数十バイト(MD5の1/20)
-
-# RAM      : 2バイト(MD5の1/32)
-
-# テーブル : 不要
-
-# 8bit演算 : 加算のみで完結
-
-# ============================================================
-
-def fletcher16(data: bytes) -> int:
-s1, s2 = 0, 0
-for b in data:
-s1 = (s1 + b) & 0xFF
-s2 = (s2 + s1) & 0xFF
-return (s2 << 8) | s1
-
-# ============================================================
-
-# Header  (仕様書 第3章)
-
-# [2: hdr_size] [2: Fletcher-16] [3: “Bad”] [2: ver] [2: colors]
-
-# [2: w] [2: h] [2: blksize] [2: total_frames]
-
-# ヘッダー全体サイズ: 2 + 2 + 15 = 19バイト固定
-
-# ============================================================
-
-def encode_header(w, h, total_frames):
-body = bytearray()
-body.extend(b’Bad’)
-body.extend(struct.pack(’<HHHHHH’, VERSION, 2, w, h, BLOCK_SIZE, total_frames))
-chk  = fletcher16(bytes(body))
-size = 2 + 2 + len(body)   # hdr_size(2) + Fletcher-16(2) + body(15)
-out  = bytearray()
-out.extend(struct.pack(’<H’, size))
-out.extend(struct.pack(’<H’, chk))
-out.extend(body)
-return bytes(out)
-
-def decode_header(data):
-“”“Returns (w, h, block_size, total_frames, hdr_size) or raises ValueError.”””
-if len(data) < 4:
-raise ValueError(“File too short for header.”)
-hdr_size   = struct.unpack(’<H’, data[0:2])[0]
-stored_chk = struct.unpack(’<H’, data[2:4])[0]
-body       = data[4:hdr_size]
-calc_chk   = fletcher16(bytes(body))
-if stored_chk != calc_chk:
-raise ValueError(
-f”Fletcher-16 Mismatch! “
-f”stored=0x{stored_chk:04X} calc=0x{calc_chk:04X} “
-f”File may be corrupted.”)
-if body[:3] != b’Bad’:
-raise ValueError(f”Invalid magic number: {body[:3]}”)
-_ver, _colors, w, h, blk, total_f = struct.unpack(’<HHHHHH’, body[3:15])
-return w, h, blk, total_f, hdr_size
-
-# ============================================================
-
-# Scan paths for RLE_BLOCK  (仕様書 6-5節)
-
-# Pattern index  = (scan_dir << 2) | start_pos_bits
-
-# scan_dir   : 0=horizontal, 1=vertical
-
-# start_pos  : bit1=start_y(0=top,1=bottom), bit0=start_x(0=left,1=right)
-
-# ============================================================
-
-def _build_scan_path(p_idx):
-scan_dir  = (p_idx >> 2) & 1
-sp        = p_idx & 3
-start_x   = 7 if (sp & 1) else 0
-start_y   = 7 if (sp & 2) else 0
-step_x    = -1 if (sp & 1) else 1
-step_y    = -1 if (sp & 2) else 1
-coords = []
-if scan_dir == 0:
-y = start_y
-while 0 <= y < 8:
-x = start_x
-while 0 <= x < 8:
-coords.append((x, y))
-x += step_x
-y += step_y
-else:
-x = start_x
-while 0 <= x < 8:
-y = start_y
-while 0 <= y < 8:
-coords.append((x, y))
-y += step_y
-x += step_x
-return np.array(coords, dtype=np.int32)
-
-SCAN_PATHS = [_build_scan_path(i) for i in range(8)]
-
-# ============================================================
-
-# RLE bit-pack / unpack  (仕様書 6-5節)
-
-# 6bit × 4 runs → 3 bytes リトルエンディアン
-
-# ============================================================
-
-def pack_rle(runs):
-r = (list(runs) + [0, 0, 0, 0])[:4]
-b0, b1, b2, b3 = [int(x) & 0x3F for x in r]
-byte0 = b0 | ((b1 & 0x03) << 6)
-byte1 = ((b1 >> 2) & 0x0F) | ((b2 & 0x0F) << 4)
-byte2 = ((b2 >> 4) & 0x03) | (b3 << 2)
-return bytes([byte0, byte1, byte2])
-
-def unpack_rle(data):
-b0, b1, b2 = data[0], data[1], data[2]
-r0 = b0 & 0x3F
-r1 = ((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2)
-r2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)
-r3 = (b2 >> 2) & 0x3F
-return [r0, r1, r2, r3]
-
-# ============================================================
-
-# RLE_BLOCK_8 bit-pack / unpack  (仕様書 6-6節)
-
-# 6bit × 8 runs → 6 bytes  (3バイトパックを2回繰り返す構造)
-
-# ============================================================
-
-def pack_rle8(runs):
-r = (list(runs) + [0]*8)[:8]
-r = [int(x) & 0x3F for x in r]
-b0 = r[0] | ((r[1] & 0x03) << 6)
-b1 = ((r[1] >> 2) & 0x0F) | ((r[2] & 0x0F) << 4)
-b2 = ((r[2] >> 4) & 0x03) | (r[3] << 2)
-b3 = r[4] | ((r[5] & 0x03) << 6)
-b4 = ((r[5] >> 2) & 0x0F) | ((r[6] & 0x0F) << 4)
-b5 = ((r[6] >> 4) & 0x03) | (r[7] << 2)
-return bytes([b0, b1, b2, b3, b4, b5])
-
-def unpack_rle8(data):
-b0,b1,b2,b3,b4,b5 = data[0],data[1],data[2],data[3],data[4],data[5]
-r0 = b0 & 0x3F
-r1 = ((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2)
-r2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)
-r3 = (b2 >> 2) & 0x3F
-r4 = b3 & 0x3F
-r5 = ((b3 >> 6) & 0x03) | ((b4 & 0x0F) << 2)
-r6 = ((b4 >> 4) & 0x0F) | ((b5 & 0x03) << 4)
-r7 = (b5 >> 2) & 0x3F
-return [r0, r1, r2, r3, r4, r5, r6, r7]
-
-# ============================================================
-
-# SHIFT_BIT helpers  (仕様書 6-3節)
-
-# ============================================================
-
-def apply_shift(block, sx, sy):
-“””
-Shift 8x8 block by (sx, sy).
-Padding: edge pixel value of the pre-shift block.
-+X = right, -X = left, +Y = down, -Y = up
-“””
-result = block.astype(np.uint8).copy()
-# X shift
-if sx > 0:
-for _ in range(sx):
-edge = result[:, -1:]
-result = np.hstack([edge, result[:, :-1]])
-elif sx < 0:
-for _ in range(-sx):
-edge = result[:, :1]
-result = np.hstack([result[:, 1:], edge])
-# Y shift
-if sy > 0:
-for _ in range(sy):
-edge = result[-1:, :]
-result = np.vstack([edge, result[:-1, :]])
-elif sy < 0:
-for _ in range(-sy):
-edge = result[:1, :]
-result = np.vstack([result[1:, :], edge])
-return result
-
-# ============================================================
-
-# Block encoder  (仕様書 9-1節)
-
-# ============================================================
-
-def _try_rle(block):
-“”“Try all 8 scan patterns × 2 start colors. Return (opcode, 3bytes) or None.”””
-best = None
-for p_idx in range(8):
-path   = SCAN_PATHS[p_idx]
-pixels = block[path[:, 1], path[:, 0]]
-for start_col in range(2):
-runs  = []
-curr  = start_col
-count = 0
-valid = True
-for px in pixels:
-if int(px) == curr:
-count += 1
-else:
-if count > 63:
-valid = False; break
-runs.append(count)
-curr  = 1 - curr
-count = 1
-if not valid:
-continue
-if count > 63:
-continue
-runs.append(count)
-if len(runs) > 4:
-continue
-opcode = 0x20 | (p_idx << 1) | start_col
-if best is None:
-best = (opcode, pack_rle(runs))
-return best
-
-def _encode_master_block(block):
-raw = np.packbits(block.flatten())
-return bytes([OP_MASTER_BLOCK_B]) + bytes(raw)  # 9 bytes total
-
-# ============================================================
-
-# RLE_BLOCK_8 encoder  (仕様書 6-6節)
-
-# _try_rle が失敗(5-8ランが必要)な場合のみ呼ばれる
-
-# ============================================================
-
-def _try_rle8(block):
-“””
-RLE8_TABLE の6パターンを試し, ランが 5-8 個に収まる最初の
-パターンを (opcode, bytes6) で返す。全て失敗なら None。
-“””
-for opcode, p_idx, start_col in RLE8_TABLE:
-path   = SCAN_PATHS[p_idx]
-pixels = block[path[:, 1], path[:, 0]]
-runs   = []
-curr   = start_col
-count  = 0
-valid  = True
-for px in pixels:
-if int(px) == curr:
-count += 1
-else:
-if count > 63:
-valid = False; break
-runs.append(count)
-curr  = 1 - curr
-count = 1
-if not valid:
-continue
-if count > 63:
-continue
-runs.append(count)
-if len(runs) > 8:
-continue
-return (opcode, pack_rle8(runs))
-return None
-
-# ============================================================
-
-# XOR_BLOCK encoder  (仕様書 6-8節)
-
-# curr と prev の XOR マスクを RLE エンコードして返す
-
-# ============================================================
-
-def _xor_block_rle(curr_b, prev_b):
-“””
-XOR マスク (64bit) を RLE エンコードして返す。
-形式: (color<<7 | run_length) の列, 1-63 ラン。
-“””
-xor_flat = (curr_b.astype(np.uint8) ^ prev_b.astype(np.uint8)).flatten()
-out = bytearray()
-i   = 0
-while i < 64:
-color = int(xor_flat[i])
-count = 1
-while i + count < 64 and int(xor_flat[i + count]) == color and count < 63:
-count += 1
-out.append((color << 7) | count)
-i += count
-return bytes(out)
-
-def encode_block(curr_b, prev_b):
-“””
-Encode one 8x8 block. Returns (bytes, type_char).
-
-```
-Priority design:
-  Phase-1: 1-byte instructions (S / X / F / I)
-           If any match is found here, RLE and MASTER are
-           never computed.  This is the critical early-exit.
-  Phase-2: RLE_BLOCK (4 bytes) -- only reached when Phase-1 misses
-  Phase-3: MASTER_BLOCK (9 bytes) -- unconditional fallback
-
-Tie-break within same byte-length: S > X > F > I > R > M
-This order maximises FOR-merge opportunities for SKIP runs.
-"""
-# ---- Phase-1: 1-byte candidates ---------------------------
-one_byte = []   # (bytes, type_char)
-
-# SKIP_BLOCK: prev との完全一致 (最優先 = FOR merge に最も効く)
-if np.array_equal(curr_b, prev_b):
-    one_byte.append((bytes([0x80]), 'S'))
-
-# SHIFT_BIT: prev を ±3 ドットシフトして一致
-# 1ピクセル移動から先に試す (小移動ほど映像的に頻出)
-if not one_byte:          # SKIP が見つかれば SHIFT 探索を省略
-    for dist in range(1, 4):          # 移動量 1 → 2 → 3 の順
-        found = False
-        for sx in range(-dist, dist + 1):
-            for sy in range(-dist, dist + 1):
-                if abs(sx) != dist and abs(sy) != dist:
-                    continue          # この dist の外周のみ試す
-                if sx == 0 and sy == 0:
-                    continue
-                if np.array_equal(apply_shift(prev_b, sx, sy), curr_b):
-                    sign_x = 1 if sx < 0 else 0
-                    mag_x  = abs(sx)
-                    sign_y = 1 if sy < 0 else 0
-                    mag_y  = abs(sy)
-                    op = 0x40 | (sign_x << 5) | (mag_x << 3) \
-                              | (sign_y << 2) | mag_y
-                    one_byte.append((bytes([op]), 'X'))
-                    found = True
-                    break
-            if found:
-                break
-        if found:
-            break
-
-# FILL_BLOCK: 全黒 / 全白
-if np.all(curr_b == 0):
-    one_byte.append((bytes([0x30]), 'F'))   # FILL_BLACK x1
-elif np.all(curr_b == 1):
-    one_byte.append((bytes([0x34]), 'F'))   # FILL_WHITE x1
-
-# BLOCK_INVERT: prev の完全反転
-if not one_byte and np.array_equal(curr_b, 1 - prev_b):
-    one_byte.append((bytes([0x00]), 'I'))
-
-# --- Early exit: 1バイト命令が1つでも見つかれば即返す -------
-if one_byte:
-    return one_byte[0]
-
-# ---- Phase-2: 複数バイト候補を全試算・最小採用 ---------------
-candidates = []
-
-# RLE_BLOCK_4 (4B)
-rle4 = _try_rle(curr_b)
-if rle4 is not None:
-    candidates.append((bytes([rle4[0]]) + rle4[1], 'R'))
-
-# XOR_BLOCK (2+N B) : opcode(1) + length(1) + RLE(N)
-# N < 7 の場合のみ MASTER_BLOCK(9B) より有利
-xor_rle = _xor_block_rle(curr_b, prev_b)
-xor_total = 2 + len(xor_rle)
-if xor_total < 9:
-    candidates.append((bytes([OP_XOR_BLOCK_B, len(xor_rle)]) + xor_rle, 'D'))
-
-# RLE_BLOCK_8 (7B) : RLE_4 が失敗した場合のみ試算
-# (4B < 7B なので RLE_4 が成功していれば RLE_8 は不要)
-if rle4 is None:
-    rle8 = _try_rle8(curr_b)
-    if rle8 is not None:
-        candidates.append((bytes([rle8[0]]) + rle8[1], 'R'))
-
-# MASTER_BLOCK (9B) : 無条件フォールバック
-candidates.append((_encode_master_block(curr_b), 'M'))
-
-return min(candidates, key=lambda c: len(c[0]))
-```
-
-# ============================================================
-
-# Multi-block merge  (SKIP / INVERT / FILL 連続をまとめる)
-
-# ============================================================
-
-def _best_for_skip(N, base_op, max_inner, max_for=65):
-“””
-N ブロックのランを FOR(n)+CMD(i) + 余り で最小バイト数にエンコードする。
-
-```
-引数:
-  N        : エンコードすべきブロック数
-  base_op  : 命令のベースオペコード (SKIP=0x80, FILL_BLACK=0x30 等)
-  max_inner: 命令1回あたりの最大ブロック数 (SKIP=64, INVERT=32, FILL=4)
-  max_for  : FOR の最大繰り返し数 (仕様上 65)
-
-返値: bytearray
-
-アルゴリズム:
-  全 i (1..max_inner) について
-    n = N // i  をベースに n-1,n,n+1 を候補として探索
-    FOR生成禁止: n < 2 は直書き, n > max_for はクランプ
-    余り r = N - n*i を再帰的にエンコード
-  最小バイト数の (n,i,r) を採用する。
-"""
-if N <= 0:
-    return bytearray()
-
-# ---- 素直な直書き (FOR なし) をベースラインとして計算 ----
-def naive_bytes(n):
-    """n ブロックを FOR なしで直書きしたバイト数"""
-    if n <= 0: return 0
-    count = 0
-    rem = n
-    while rem > 0:
-        take = min(rem, max_inner)
-        count += 1
-        rem -= take
-    return count
-
-best_cost = naive_bytes(N)
-best_buf  = None
-
-# ---- FOR(n) + CMD(i) の全候補を探索 --------------------
-for i in range(1, max_inner + 1):
-    # N / i の前後を候補とする
-    for n_cand in (N // i, N // i + 1):
-        if n_cand < 2:
-            continue                     # FOR 0,1 は禁止 (2回未満)
-        n = min(n_cand, max_for)         # FOR 上限クランプ
-        product = n * i
-        if product > N:
-            continue
-        remainder = N - product
-
-        # コスト = 2 (FOR+CMD) + 余りの直書きコスト
-        cost = 2 + naive_bytes(remainder)
-        if cost < best_cost:
-            best_cost = cost
-            best_buf  = (n, i, remainder)
-
-# ---- エンコード出力生成 ---------------------------------
-out = bytearray()
-if best_buf is None:
-    # FOR なし直書き
-    rem = N
-    while rem > 0:
-        take = min(rem, max_inner)
-        out.append(base_op | (take - 1))
-        rem -= take
-else:
-    n, i, remainder = best_buf
-    for_byte  = 0xC0 | (n - 2)
-    inner_op  = base_op | (i - 1)
-    out.extend([for_byte, inner_op])
-    # 余りを再帰的にエンコード（余りは必ず N より小さい）
-    out.extend(_best_for_skip(remainder, base_op, max_inner, max_for))
-
-return out
-```
-
-# ============================================================
-
-# Multi-block merge  (SKIP / INVERT / FILL 連続をまとめる)
-
-# FOR(n)+CMD(i) 最適化を内包
-
-# ============================================================
-
-def _merge_multiblock(raw_cmds, raw_types):
-result_c, result_t = [], []
-i = 0
-while i < len(raw_cmds):
-t = raw_types[i]
-c = raw_cmds[i]
-
-```
-    # ---- SKIP_BLOCK ランを集約 -------------------------
-    if t == 'S' and c == bytes([0x80]):
-        j = i
-        while j < len(raw_cmds) and raw_types[j] == 'S' \
-                and raw_cmds[j] == bytes([0x80]):
-            j += 1
-        N   = j - i
-        buf = _best_for_skip(N, 0x80, 64)
-        # FOR命令が含まれる場合は1トークンとして扱う
-        result_c.append(bytes(buf))
-        result_t.append('S')
-        i = j
-
-    # ---- BLOCK_INVERT ランを集約 -----------------------
-    elif t == 'I' and c == bytes([0x00]):
-        j = i
-        while j < len(raw_cmds) and raw_types[j] == 'I' \
-                and raw_cmds[j] == bytes([0x00]):
-            j += 1
-        N   = j - i
-        buf = _best_for_skip(N, 0x00, 32)
-        result_c.append(bytes(buf))
-        result_t.append('I')
-        i = j
-
-    # ---- FILL_BLOCK ランを集約 -------------------------
-    elif t == 'F' and len(c) == 1:
-        base = c[0] & 0xFC   # 色ビット保持、カウントビットを落とす
-        j    = i
-        while j < len(raw_cmds) and raw_types[j] == 'F' \
-                and len(raw_cmds[j]) == 1 \
-                and (raw_cmds[j][0] & 0xFC) == base:
-            j += 1
-        N   = j - i
-        buf = _best_for_skip(N, base, 4)
-        result_c.append(bytes(buf))
-        result_t.append('F')
-        i = j
-
-    else:
-        result_c.append(c)
-        result_t.append(t)
-        i += 1
-
-return result_c, result_t
-```
-
-# ============================================================
-
-# FOR optimizer  (仕様書 9-2節)
-
-# S/F/I ランは _merge_multiblock が既に FOR 最適化済み。
-
-# ここでは RLE/SHIFT 等の残余の単一バイト命令ランに FOR を適用する。
-
-# ============================================================
-
-def optimize_for(cmds, types):
-“””
-Merge consecutive identical single-byte commands using FOR.
-S/F/I multi-byte tokens (already FOR-optimized by _merge_multiblock)
-are passed through as-is.
-FOR 0 (2x) and FOR 1 (3x) are forbidden -> write literally.
-“””
-out_b = bytearray()
-out_t = []
-i     = 0
-while i < len(cmds):
-cmd = cmds[i]
-t   = types[i]
-# マルチバイトトークン (S/F/I の FOR 最適化済みバイト列) はそのまま通過
-if len(cmd) != 1:
-out_b.extend(cmd)
-out_t.append(t)
-i += 1
-continue
-# 単一バイト命令の連続を FOR でまとめる (RLE/SHIFT/MASTER 等)
-j = i + 1
-while j < len(cmds) and cmds[j] == cmd and len(cmds[j]) == 1:
-j += 1
-n   = j - i
-rem = n
-while rem > 0:
-if rem <= 3:
-for _ in range(rem):
-out_b.extend(cmd)
-out_t.append(t)
-rem = 0
-else:
-take     = min(rem, 65)
-for_byte = 0xC0 | (take - 2)
-out_b.extend([for_byte, cmd[0]])
-out_t.append(t)
-rem -= take
-i = j
-return bytes(out_b), out_t
-
-# ============================================================
-
-# RLE_FRAME encoder / decoder  (仕様書 第7章)
-
-# 
-
-# オペコード 0x30-0x37 = 8走査パターン
-
-# bit2 : 走査方向  (0=横優先, 1=縦優先)
-
-# bit1 : 開始Y     (0=y=0,    1=y=height_max)
-
-# bit0 : 開始X     (0=x=0,    1=x=width_max)
-
-# 
-
-# エンコード時に全8パターンを試算し最小バイト数を採用する。
-
-# ============================================================
-
-def _rle_scan_pixels(frame, scan_dir, start_y, start_x):
-“””
-フレームを指定走査パターンで1次元化して返す (numpy 版)。
-flip + 転置の組み合わせで8パターンを O(1) で生成。
-“””
-f = frame
-if start_x: f = f[:, ::-1]   # 水平反転
-if start_y: f = f[::-1, :]   # 垂直反転
-if scan_dir: f = f.T          # 縦優先は転置 (h,w) -> (w,h)
-return f.flatten()
-
-def _rle_encode_pixels(pixels):
-“”“1次元ピクセル列を RLE バイト列に変換。”””
-out = bytearray()
-i = 0
-n = len(pixels)
-while i < n:
-color = int(pixels[i])
-count = 1
-while i + count < n and int(pixels[i + count]) == color and count < 127:
-count += 1
-out.append((color << 7) | count)
-i += count
-return bytes(out)
-
-def encode_rle_frame_best(frame):
-“””
-8パターン全試算し最小バイト数の (opcode + rle_data) を返す。
-0x30 (横/TL) は旧 RLE_FRAME と同一なので後方互換を保つ。
-“””
-best_bytes = None
-best_op    = 0x30
-for scan_dir in range(2):
-for start_y in range(2):
-for start_x in range(2):
-op  = 0x30 | (scan_dir << 2) | (start_y << 1) | start_x
-pix = _rle_scan_pixels(frame, scan_dir, start_y, start_x)
-rle = _rle_encode_pixels(pix)
-if best_bytes is None or len(rle) < len(best_bytes):
-best_bytes = rle
-best_op    = op
-return bytes([best_op]) + best_bytes
-
-# 旧名互換エイリアス (decode_frame から呼ばれる)
-
-def encode_rle_frame(frame_2d):
-“”“シンプルな横/TL固定 (0x30)。テスト・後方互換用。”””
-pix = _rle_scan_pixels(frame_2d, 0, 0, 0)
-return _rle_encode_pixels(pix)
-
-# ============================================================
-
-# Frame-level decode  (仕様書 第7章)
-
-# ============================================================
-
-def decode_frame(data, prev_f, w, h):
-bx     = w // BLOCK_SIZE
-by_cnt = h // BLOCK_SIZE
-n_blk  = bx * by_cnt
-op     = data[0]
-
-```
-if op == OP_SKIP_FRAME:
-    return prev_f.copy()
-if op == OP_FRAME_FILL_BLACK:
-    return np.zeros((h, w), dtype=np.uint8)
-if op == OP_FRAME_FILL_WHITE:
-    return np.ones((h, w), dtype=np.uint8)
-if op == OP_INVERT_PREV:
-    return (1 - prev_f).astype(np.uint8)
-if op == OP_MASTER_FRAME:
-    bits = np.unpackbits(np.frombuffer(data[1:], dtype=np.uint8))[:w * h]
-    return bits.reshape(h, w).astype(np.uint8)
-# RLE_FRAME: 0x30-0x37 (8走査パターン)
-if 0x30 <= op <= 0x37:
-    scan_dir = (op >> 2) & 1
-    start_y  = (op >> 1) & 1
-    start_x  =  op       & 1
-    return _decode_rle_frame(data[1:], w, h, scan_dir, start_y, start_x)
-if op == OP_BLOCK_STREAM:
-    return _decode_block_stream(data[1:], prev_f, w, h, bx, n_blk)
-
-raise ValueError(f"Unknown frame opcode: 0x{op:02X}")
-```
-
-def _decode_rle_frame(rle, w, h, scan_dir=0, start_y=0, start_x=0):
-“””
-RLE バイト列を走査パターンに従ってデコードし (h, w) フレームを返す。
-
-```
-エンコード時の変換:
-  1. start_x が 1 なら水平反転
-  2. start_y が 1 なら垂直反転
-  3. scan_dir が 1 なら転置 (縦優先)
-  4. flatten して RLE
-
-デコードは逆順で復元する。
-"""
-total  = w * h
-pixels = []
-for byte in rle:
-    color  = (byte >> 7) & 1
-    length = byte & 0x7F
-    if length == 0:
-        break
-    pixels.extend([color] * length)
-    if len(pixels) >= total:
-        break
-
-arr = np.array(pixels[:total], dtype=np.uint8)
-
-# 逆変換: scan_dir=1 は転置状態なので (w,h) にリシェイプ後転置
-if scan_dir:
-    frame = arr.reshape(w, h).T   # (w,h) -> (h,w)
-else:
-    frame = arr.reshape(h, w)
-
-# flip を元に戻す (エンコードと逆順)
-if start_y: frame = frame[::-1, :]
-if start_x: frame = frame[:, ::-1]
-
-return frame.astype(np.uint8)
-```
-
-def _decode_block_stream(stream, prev_f, w, h, bx, n_blk):
-curr_f = np.zeros((h, w), dtype=np.uint8)
-ptr    = 0
-b_idx  = 0
-
-```
-def do_block(cmd, b_i, p):
-    nonlocal curr_f
-    by_i = b_i // bx
-    bx_i = b_i % bx
-    y    = by_i * BLOCK_SIZE
-    x    = bx_i * BLOCK_SIZE
-
-    # SKIP_BLOCK
-    if cmd & 0x80:
-        cnt = (cmd & 0x3F) + 1
-        for k in range(cnt):
-            if b_i + k < n_blk:
-                yy = ((b_i + k) // bx) * BLOCK_SIZE
-                xx = ((b_i + k) % bx) * BLOCK_SIZE
-                curr_f[yy:yy+BLOCK_SIZE, xx:xx+BLOCK_SIZE] = \
-                    prev_f[yy:yy+BLOCK_SIZE, xx:xx+BLOCK_SIZE]
-        return b_i + cnt, p
-
-    # BLOCK_INVERT
-    if cmd <= 0x1F:
-        cnt = (cmd & 0x1F) + 1
-        for k in range(cnt):
-            if b_i + k < n_blk:
-                yy = ((b_i + k) // bx) * BLOCK_SIZE
-                xx = ((b_i + k) % bx) * BLOCK_SIZE
-                curr_f[yy:yy+BLOCK_SIZE, xx:xx+BLOCK_SIZE] = \
-                    1 - prev_f[yy:yy+BLOCK_SIZE, xx:xx+BLOCK_SIZE]
-        return b_i + cnt, p
-
-    # RLE_BLOCK_4 (4-run)
-    if 0x20 <= cmd <= 0x2F:
-        p_idx     = (cmd >> 1) & 0x07
-        start_col = cmd & 0x01
-        runs  = unpack_rle(stream[p:p+3])
-        path  = SCAN_PATHS[p_idx]
-        pix   = []
-        col   = start_col
-        for r in runs:
-            pix.extend([col] * r)
-            col = 1 - col
-        blk = np.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=np.uint8)
-        for idx, v in enumerate(pix[:64]):
-            blk[path[idx, 1], path[idx, 0]] = v   # path[i]=(x,y) → blk[y,x]
-        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = blk
-        return b_i + 1, p + 3
-
-    # FILL_BLOCK
-    if 0x30 <= cmd <= 0x37:
-        color = (cmd >> 2) & 1
-        cnt   = (cmd & 0x03) + 1
-        for k in range(cnt):
-            if b_i + k < n_blk:
-                yy = ((b_i + k) // bx) * BLOCK_SIZE
-                xx = ((b_i + k) % bx) * BLOCK_SIZE
-                curr_f[yy:yy+BLOCK_SIZE, xx:xx+BLOCK_SIZE] = color
-        return b_i + cnt, p
-
-    # RLE_BLOCK_8 (8-run, 6 data bytes)
-    if cmd in RLE8_OPCODES:
-        entry = next(e for e in RLE8_TABLE if e[0] == cmd)
-        _, p_idx, start_col = entry
-        runs  = unpack_rle8(stream[p:p+6])
-        path  = SCAN_PATHS[p_idx]
-        pix   = []
-        col   = start_col
-        for r in runs:
-            pix.extend([col] * r)
-            col = 1 - col
-        blk = np.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=np.uint8)
-        for idx, v in enumerate(pix[:64]):
-            blk[path[idx, 1], path[idx, 0]] = v   # path[i]=(x,y) → blk[y,x]
-        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = blk
-        return b_i + 1, p + 6
-
-    # MASTER_BLOCK
-    if cmd == OP_MASTER_BLOCK_B:
-        bits = np.unpackbits(np.frombuffer(stream[p:p+8], dtype=np.uint8))
-        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = \
-            bits.reshape(BLOCK_SIZE, BLOCK_SIZE)
-        return b_i + 1, p + 8
-
-    # XOR_BLOCK (variable length: length_byte + RLE_data)
-    if cmd == OP_XOR_BLOCK_B:
-        xor_len = stream[p]; p += 1
-        xor_pix = []
-        j = p
-        while len(xor_pix) < 64 and j < p + xor_len:
-            b    = stream[j]; j += 1
-            col  = (b >> 7) & 1
-            run  = b & 0x7F
-            xor_pix.extend([col] * min(run, 64 - len(xor_pix)))
-        xor_mask = np.array(xor_pix[:64], dtype=np.uint8).reshape(BLOCK_SIZE, BLOCK_SIZE)
-        prev_blk = prev_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE]
-        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = (prev_blk ^ xor_mask).astype(np.uint8)
-        return b_i + 1, p + xor_len
-
-    # SHIFT_BIT
-    if 0x40 <= cmd <= 0x7F:
-        sign_x = (cmd >> 5) & 1
-        mag_x  = (cmd >> 3) & 3
-        sign_y = (cmd >> 2) & 1
-        mag_y  =  cmd       & 3
-        sx     = -mag_x if sign_x else mag_x
-        sy     = -mag_y if sign_y else mag_y
-        pb     = prev_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE]
-        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = apply_shift(pb, sx, sy)
-        return b_i + 1, p
-
-    # Unknown -- skip 1 block
-    return b_i + 1, p
-
-while b_idx < n_blk and ptr < len(stream):
-    cmd = stream[ptr]; ptr += 1
-    # FOR
-    if cmd & 0xC0 == 0xC0:
-        repeat = (cmd & 0x3F) + 2
-        if ptr >= len(stream):
-            break
-        ncmd = stream[ptr]; ptr += 1
-        for _ in range(repeat):
-            if b_idx >= n_blk:
-                break
-            b_idx, ptr = do_block(ncmd, b_idx, ptr)
-        continue
-    b_idx, ptr = do_block(cmd, b_idx, ptr)
-
-return curr_f
-```
-
-# ============================================================
-
-# Frame size calculator  (stream parser に必要)
-
-# ============================================================
-
-def frame_data_size(data, offset, w, h):
-“”“Return byte size of one frame starting at data[offset].”””
-op = data[offset]
-# Fixed 1-byte frames
-if op in (OP_SKIP_FRAME, OP_FRAME_FILL_BLACK,
-OP_FRAME_FILL_WHITE, OP_INVERT_PREV):
-return 1
-# MASTER_FRAME: 1 + w*h/8
-if op == OP_MASTER_FRAME:
-return 1 + (w * h) // 8
-# RLE_FRAME: 0x30-0x37 (8走査パターン共通)
-if 0x30 <= op <= 0x37:
-total  = w * h
-count  = 0
-i      = offset + 1
-while count < total and i < len(data):
-byte   = data[i]
-length = byte & 0x7F
-if length == 0:
-i += 1; break
-count += length
-i     += 1
-return i - offset
-# BLOCK_STREAM: parse block commands until all blocks consumed
-if op == OP_BLOCK_STREAM:
-bx     = w // BLOCK_SIZE
-n_blk  = bx * (h // BLOCK_SIZE)
-b_idx  = 0
-ptr    = offset + 1
-while b_idx < n_blk and ptr < len(data):
-cmd = data[ptr]; ptr += 1
-# FOR
-if cmd & 0xC0 == 0xC0:
-repeat = (cmd & 0x3F) + 2
-if ptr >= len(data):
-break
-ncmd = data[ptr]; ptr += 1
-advance = _block_advance(ncmd)
-extra   = _block_extra_bytes(ncmd)
-for _ in range(repeat):
-if b_idx >= n_blk:
-break
-b_idx += advance
-ptr   += extra
-continue
-# XOR_BLOCK: variable length (special case)
-if cmd == OP_XOR_BLOCK_B:
-if ptr < len(data):
-xor_len = data[ptr]; ptr += 1
-ptr += xor_len
-b_idx += 1
-continue
-b_idx += _block_advance(cmd)
-ptr   += _block_extra_bytes(cmd)
-return ptr - offset
-return 1
-
-def _block_advance(cmd):
-“”“How many blocks does this command consume?”””
-if cmd & 0x80:              return (cmd & 0x3F) + 1   # SKIP_BLOCK
-if cmd <= 0x1F:             return (cmd & 0x1F) + 1   # BLOCK_INVERT
-if 0x20 <= cmd <= 0x2F:    return 1                    # RLE_BLOCK_4
-if 0x30 <= cmd <= 0x37:    return (cmd & 0x03) + 1    # FILL_BLOCK
-if cmd in RLE8_OPCODES:    return 1                    # RLE_BLOCK_8
-if cmd == OP_MASTER_BLOCK_B: return 1                  # MASTER_BLOCK
-# OP_XOR_BLOCK_B (0x3F) is variable-length; handled separately
-if 0x40 <= cmd <= 0x7F:    return 1                    # SHIFT_BIT
-return 1
-
-def _block_extra_bytes(cmd):
-“”“How many fixed extra data bytes follow this command? (variable-length handled separately)”””
-if 0x20 <= cmd <= 0x2F:    return 3   # RLE_BLOCK_4: 3 bytes
-if cmd in RLE8_OPCODES:    return 6   # RLE_BLOCK_8: 6 bytes
-if cmd == OP_MASTER_BLOCK_B: return 8  # MASTER_BLOCK: 8 bytes
-# OP_XOR_BLOCK_B (0x3F): variable, handled by frame_data_size directly
-return 0
-
-# ============================================================
-
-# Self-verify  (仕様書 13-5節)
-
-# ============================================================
-
-def _self_verify(frame_idx, data, types, original, prev_f, w, h):
-err = None
-try:
-decoded = decode_frame(data, prev_f, w, h)
-if np.array_equal(decoded, original):
-return frame_idx, data, types, None
-err = “verify mismatch”
-except Exception as e:
-err = str(e)
-
-```
-# Fallback: MASTER_FRAME
-fb_data = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(original.flatten()))
-n_blk   = (w // BLOCK_SIZE) * (h // BLOCK_SIZE)
-try:
-    decoded2 = decode_frame(fb_data, prev_f, w, h)
-    if np.array_equal(decoded2, original):
-        return frame_idx, fb_data, ['M'] * n_blk, f"fallback({err})"
-except Exception as e2:
-    err = f"{err} | fallback_fail: {e2}"
-
-return frame_idx, fb_data, ['M'] * n_blk, f"CRITICAL frame {frame_idx}: {err}"
-```
-
-# ============================================================
-
-# Frame encoder worker  (multiprocessing)
-
-# ============================================================
-
-def encode_frame_worker(args):
-frame_idx, curr_path, prev_path, w, h = args
-
-```
-curr_f = np.array(Image.open(curr_path).convert('1'), dtype=np.uint8)
-if prev_path and os.path.exists(prev_path):
-    prev_f = np.array(Image.open(prev_path).convert('1'), dtype=np.uint8)
-else:
-    prev_f = np.zeros((h, w), dtype=np.uint8)
-
-bx     = w // BLOCK_SIZE
-n_blk  = bx * (h // BLOCK_SIZE)
-raw_sz = (w * h) // 8
-
-# --- Frame-level single commands (候補D) ---
-if np.array_equal(curr_f, prev_f):
-    return _self_verify(frame_idx, bytes([OP_SKIP_FRAME]),
-                        ['S'] * n_blk, curr_f, prev_f, w, h)
-if np.all(curr_f == 0):
-    return _self_verify(frame_idx, bytes([OP_FRAME_FILL_BLACK]),
-                        ['F'] * n_blk, curr_f, prev_f, w, h)
-if np.all(curr_f == 1):
-    return _self_verify(frame_idx, bytes([OP_FRAME_FILL_WHITE]),
-                        ['F'] * n_blk, curr_f, prev_f, w, h)
-if np.array_equal(curr_f, 1 - prev_f):
-    return _self_verify(frame_idx, bytes([OP_INVERT_PREV]),
-                        ['I'] * n_blk, curr_f, prev_f, w, h)
-
-# --- Block-level encoding ---
-raw_cmds, raw_types = [], []
-for b in range(n_blk):
-    y = (b // bx) * BLOCK_SIZE
-    x = (b %  bx) * BLOCK_SIZE
-    cmd, t = encode_block(
-        curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE],
-        prev_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE])
-    raw_cmds.append(cmd)
-    raw_types.append(t)
-
-merged_c, merged_t   = _merge_multiblock(raw_cmds, raw_types)
-opt_bytes, opt_types = optimize_for(merged_c, merged_t)
-
-# Candidate A: BLOCK_STREAM
-cand_a = bytes([OP_BLOCK_STREAM]) + opt_bytes
-
-# Candidate B: RLE_FRAME (8走査パターン全試算・最小を採用)
-cand_b = encode_rle_frame_best(curr_f)
-
-# Candidate C: MASTER_FRAME
-cand_c = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(curr_f.flatten()))
-
-best = min(
-    (cand_a, opt_types),
-    (cand_b, ['R'] * n_blk),
-    (cand_c, ['M'] * n_blk),
-    key=lambda x: len(x[0])
-)
-data, types = best
-
-return _self_verify(frame_idx, data, types, curr_f, prev_f, w, h)
-```
-
-# ============================================================
-
-# UI helpers
-
-# ============================================================
-
-def _bar_hash(curr, total, width=40):
-r    = curr / total if total > 0 else 0
-done = int(width * r)
-return f”[{’#’*done}{’.’*(width-done)}] {int(r*100):3d}% ({curr}/{total})”
-
-def _bar_block(ratio, width=20):
-done = int(width * ratio)
-return f”{‘█’*done}{‘░’*(width-done)} {ratio*100:4.1f}%”
-
-def _block_map(types, bx, max_rows=8, max_cols=30):
-rows = min(max_rows, len(types) // bx if bx > 0 else 0)
-cols = min(max_cols, bx)
-lines = []
-for r in range(rows):
-row = “”
-for c in range(cols):
-idx = r * bx + c
-t   = types[idx] if idx < len(types) else ‘?’
-row += f”{TYPE_COLOR.get(t, C_RESET)}{t}{C_RESET} “
-lines.append(row)
-return lines
-
-# ============================================================
-
-# Frame-level FOR merge pass  (仕様書 9-2節・13章)
-
-# 
-
-# 判定ルール：
-
-# フレーム命令を素直に書いて良いのは
-
-# 「直前がフレーム命令でない」かつ「直前と同じフレーム命令でない」
-
-# それ以外は FOR への包含を検討する
-
-# 
-
-# FOR 禁止：FOR 0(2回)・FOR 1(3回) → N≦3 は個別に書く
-
-# FOR 上限：65回 → 65を超える場合は次のFORブロックに分割
-
-# ============================================================
-
-SINGLE_BYTE_FRAME_OPS = {
-OP_SKIP_FRAME,
-OP_FRAME_FILL_BLACK,
-OP_FRAME_FILL_WHITE,
-OP_INVERT_PREV,
+static void bad_memcpy(uint8_t *dst, const uint8_t *src, uint16_t len)
+{
+while (len–) { *dst++ = *src++; }
 }
 
-def merge_frame_for(ordered_frames):
-“””
-ordered_frames: list of (data_bytes, blk_types)
-全フレームを順番に受け取り、連続するフレーム命令を FOR でまとめる。
+/* ============================================================
+
+- Internal: Fletcher-16  (SPEC.md 3-3)
+- ============================================================ */
+
+static uint16_t fletcher16(const uint8_t *data, uint8_t len)
+{
+uint8_t s1 = 0U, s2 = 0U;
+while (len–) {
+s1 = (uint8_t)(s1 + *data++);
+s2 = (uint8_t)(s2 + s1);
+}
+return (uint16_t)(((uint16_t)s2 << 8U) | s1);
+}
+
+/* ============================================================
+
+- Internal: stream read helpers
+- ============================================================ */
+
+static uint8_t bad_read1(bad_ctx_t *ctx)
+{
+uint8_t b = 0xFFU;
+ctx->read(ctx->stream_offset, &b, 1U);
+ctx->stream_offset++;
+return b;
+}
+
+static uint16_t bad_readn(bad_ctx_t *ctx, uint8_t *buf, uint16_t len)
+{
+uint16_t n = ctx->read(ctx->stream_offset, buf, len);
+ctx->stream_offset += n;
+return n;
+}
+
+/* ============================================================
+
+- Internal: gram bit helpers
+- bit_idx = y * width + x  (row-major, little-endian)
+- ============================================================ */
+
+BAD_STATIC_INLINE uint8_t gp_get(const uint8_t *buf, uint16_t idx)
+{
+return (buf[idx >> 3U] >> (idx & 7U)) & 1U;
+}
+
+BAD_STATIC_INLINE void gp_set(uint8_t *buf, uint16_t idx, uint8_t val)
+{
+if (val) buf[idx>>3U] |=  (uint8_t)(1U<<(idx&7U));
+else     buf[idx>>3U] &= ~(uint8_t)(1U<<(idx&7U));
+}
+
+/* ============================================================
+
+- Internal: block coordinate helpers
+- ============================================================ */
+
+BAD_STATIC_INLINE uint8_t  blk_nx(const bad_ctx_t *ctx) { return (uint8_t)(ctx->width  >> 3U); }
+BAD_STATIC_INLINE uint8_t  blk_ny(const bad_ctx_t *ctx) { return (uint8_t)(ctx->height >> 3U); }
+
+BAD_STATIC_INLINE uint16_t blk_bit(const bad_ctx_t *ctx,
+uint8_t bx, uint8_t by,
+uint8_t px, uint8_t py)
+{
+return (uint16_t)(((uint16_t)(by<<3U)+py)*ctx->width
++ ((uint16_t)(bx<<3U)+px));
+}
+
+/* ============================================================
+
+- Internal: scan-path coordinate generator
+- 
+- Pattern index (same as Python SCAN_PATHS):
+- bit2=scan_dir (0=H 1=V)  bit1=start_y  bit0=start_x
+- 
+- Returns pixel coordinates in scan order via callback-style:
+- Caller provides a pixel-setter; avoids a 64-entry coord table.
+- 
+- For RLE_BLOCK_4/8: pattern comes from opcode bits.
+- ============================================================ */
+
+/* Apply runs[] to gram block (bx,by) using scan pattern p_idx */
+static void apply_rle_runs(bad_ctx_t *ctx,
+uint8_t bx, uint8_t by,
+uint8_t p_idx, uint8_t start_color,
+const uint8_t *runs, uint8_t n_runs)
+{
+uint8_t scan_dir = (p_idx >> 2U) & 1U;
+uint8_t sx       = (p_idx & 1U) ? 7U : 0U;
+uint8_t sy       = (p_idx & 2U) ? 7U : 0U;
+int8_t  dx       = (p_idx & 1U) ? -1 : 1;
+int8_t  dy       = (p_idx & 2U) ? -1 : 1;
 
 ```
-Returns: (merged_bytes, display_list)
-  display_list: [(data_bytes, blk_types), ...] UIに渡す順序付きリスト
-"""
-out     = bytearray()
-display = []   # UI表示用に (data, types) を保持
-i       = 0
-n       = len(ordered_frames)
+uint8_t color   = start_color;
+uint8_t ri      = 0U;
+uint8_t remain  = (n_runs > 0U) ? runs[0] : 0U;
 
-while i < n:
-    data, types = ordered_frames[i]
+uint8_t outer;
+for (outer = 0U; outer < BAD_BLOCK_SIZE; outer++) {
+    uint8_t inner;
+    for (inner = 0U; inner < BAD_BLOCK_SIZE; inner++) {
+        uint8_t px, py;
+        if (scan_dir == 0U) {
+            py = (uint8_t)(sy + (int8_t)outer * dy);
+            px = (uint8_t)(sx + (int8_t)inner * dx);
+        } else {
+            px = (uint8_t)(sx + (int8_t)outer * dx);
+            py = (uint8_t)(sy + (int8_t)inner * dy);
+        }
+        gp_set(ctx->gram, blk_bit(ctx, bx, by, px, py), color);
 
-    # 単一バイトフレーム命令かどうか
-    if len(data) == 1 and data[0] in SINGLE_BYTE_FRAME_OPS:
-        op = data[0]
-
-        # 連続する同じ命令を数える(FOR上限65まで)
-        j = i + 1
-        while (j < n
-               and len(ordered_frames[j][0]) == 1
-               and ordered_frames[j][0][0] == op
-               and (j - i) < 65):
-            j += 1
-        count = j - i   # 連続数
-
-        rem = count
-        while rem > 0:
-            take = min(rem, 65)
-            if take <= 3:
-                # FOR 0・1 禁止 → 個別に書く
-                for k in range(take):
-                    out.extend([op])
-                    display.append((bytes([op]), types))
-            else:
-                # FOR (take-2) + op の2バイトで表現
-                for_byte = 0xC0 | (take - 2)
-                out.extend([for_byte, op])
-                # display は FOR対象フレームをまとめて1エントリとして記録
-                display.append((bytes([for_byte, op]), types))
-            rem -= take
-        i = j
-
-    else:
-        # BLOCK_STREAM / RLE_FRAME / MASTER_FRAME はそのまま
-        out.extend(data)
-        display.append((data, types))
-        i += 1
-
-return bytes(out), display
+        if (remain > 0U) remain--;
+        if (remain == 0U) {
+            color ^= 1U;
+            ri++;
+            if (ri < n_runs) remain = runs[ri];
+        }
+    }
+}
 ```
 
-# ============================================================
+}
 
-# Encoder
+/* ============================================================
 
-# ============================================================
+- Internal: frame-level fill / copy
+- ============================================================ */
 
-def do_encode(args):
-st_i    = int(args.start)
-ed_i    = int(args.end)
-pad     = len(args.start)
-total_f = ed_i - st_i + 1
+static void fill_frame(bad_ctx_t *ctx, uint8_t color)
+{
+bad_memset(ctx->gram,
+color ? 0xFFU : 0x00U,
+BAD_GRAM_SIZE(ctx->width, ctx->height));
+}
 
-```
-first = os.path.join(args.path, f"{args.suffix}{st_i:0{pad}d}.bmp")
-if not os.path.exists(first):
-    print(f"Error: {first} not found."); sys.exit(1)
+static void swap_to_prev(bad_ctx_t *ctx)
+{
+bad_memcpy(ctx->prev, ctx->gram,
+BAD_GRAM_SIZE(ctx->width, ctx->height));
+}
 
-img = Image.open(first)
-w, h = img.size
-if w % BLOCK_SIZE or h % BLOCK_SIZE:
-    print(f"Error: {w}x{h} is not divisible by {BLOCK_SIZE}."); sys.exit(1)
+/* ============================================================
 
-bx     = w // BLOCK_SIZE
-raw_sz = (w * h) // 8
-ncpu   = cpu_count()
+- Internal: MASTER_BLOCK decode  (SPEC.md 6-8)
+- 8 raw bytes, row-major, bit0=left pixel
+- ============================================================ */
 
-# Build task list
-tasks = []
-for i in range(st_i, ed_i + 1):
-    curr = os.path.join(args.path, f"{args.suffix}{i:0{pad}d}.bmp")
-    prev = os.path.join(args.path, f"{args.suffix}{i-1:0{pad}d}.bmp") \
-           if i > st_i else None
-    tasks.append((i, curr, prev, w, h))
+static bad_result_t decode_master_block(bad_ctx_t *ctx,
+uint8_t bx, uint8_t by)
+{
+uint8_t row, col, byte_buf;
+for (row = 0U; row < BAD_BLOCK_SIZE; row++) {
+if (ctx->read(ctx->stream_offset, &byte_buf, 1U) != 1U)
+return BAD_ERR_DATA;
+ctx->stream_offset++;
+for (col = 0U; col < BAD_BLOCK_SIZE; col++)
+gp_set(ctx->gram,
+blk_bit(ctx, bx, by, col, row),
+(byte_buf >> col) & 1U);
+}
+return BAD_OK;
+}
 
-print(f"\033[2J\033[H", end="")
-print(f"Starting Encode (Shift & FOR optimized)...")
-time.sleep(0.2)
-print(f"\033[2J\033[H", end="")
+/* ============================================================
 
-# -------------------------------------------------------
-# Phase 1: 並列エンコード → 全フレームを順序付きで収集
-#   書き込みはまだ行わない。
-#   フレームFOR最適化は全フレーム確定後に行うため。
-# -------------------------------------------------------
-write_ptr     = st_i
-buffer        = {}
-ordered_frames = []   # (data, blk_types) in frame order
-win_90        = deque(maxlen=90)
-errors        = []
+- Internal: RLE_BLOCK_4 decode  (SPEC.md 6-5)
+- 3 data bytes, 4 runs max, path[] based placement
+- ============================================================ */
 
-with Pool(ncpu) as pool:
-    for result in pool.imap_unordered(encode_frame_worker, tasks):
-        f_idx, enc_data, blk_types, err = result
-        if err:
-            errors.append(err)
-        buffer[f_idx] = (enc_data, blk_types)
-
-        # 順序保証バッファから連続して取り出す
-        while write_ptr in buffer:
-            bd, bt = buffer.pop(write_ptr)
-            ordered_frames.append((bd, bt))
-
-            ratio = len(bd) / raw_sz * 100
-            win_90.append(ratio)
-            avg   = sum(win_90) / len(win_90)
-            curr_c = len(ordered_frames)
-            p_rat  = curr_c / total_f
-
-            sys.stdout.write('\033[H')
-            print(f"{C_BOLD}BadCodec v0.5.1 Encoder{C_RESET}"
-                  f"  [{ncpu} cores]  Phase 1/2: Encoding")
-            print(_bar_block(p_rat))
-            print(f"Frame: {write_ptr:04d} | "
-                  f"Size: {len(bd):6d}B | "
-                  f"Avg: {avg:5.2f}%")
-
-            for line in _block_map(bt, bx):
-                print(line)
-            shown = len(_block_map(bt, bx))
-            for _ in range(min(8, h // BLOCK_SIZE) - shown):
-                print()
-
-            write_ptr += 1
-
-# -------------------------------------------------------
-# Phase 2: フレームFOR最適化マージ
-#   連続する同一フレーム命令を FOR に包含する。
-#   この処理は全フレームが確定してからでないと正確に行えない。
-# -------------------------------------------------------
-sys.stdout.write('\033[H')
-print(f"{C_BOLD}BadCodec v0.5.1 Encoder{C_RESET}"
-      f"  [{ncpu} cores]  Phase 2/2: Frame FOR merge...")
-print()
-
-merged_stream, display_list = merge_frame_for(ordered_frames)
-
-# -------------------------------------------------------
-# Phase 3: ファイル書き込み
-# -------------------------------------------------------
-header      = encode_header(w, h, total_f)
-total_bytes = len(header) + len(merged_stream)
-
-with open(args.output, 'wb') as f:
-    f.write(header)
-    f.write(merged_stream)
-
-raw_total = (w * h * total_f) // 8
-print(f"{C_BOLD}Done.{C_RESET} Saved to {args.output} "
-      f"({total_bytes:,} bytes, "
-      f"{total_bytes / raw_total * 100:.1f}% of raw)")
-print(f"Frame FOR merged stream: {len(merged_stream):,} bytes "
-      f"(before merge: "
-      f"{sum(len(d) for d,_ in ordered_frames):,} bytes)")
-
-if errors:
-    print(f"\n{C_RED}Warnings ({len(errors)}):{C_RESET}")
-    for e in errors[:10]:
-        print(f"  {e}")
-```
-
-# ============================================================
-
-# Decoder
-
-# ============================================================
-
-def do_decode(args):
-if not args.input:
-print(“Error: -i is required for decode.”); sys.exit(1)
-if not os.path.exists(args.input):
-print(f”Error: {args.input} not found.”); sys.exit(1)
+static bad_result_t decode_rle4(bad_ctx_t *ctx,
+uint8_t bx, uint8_t by,
+uint8_t op)
+{
+uint8_t d[3];
+if (bad_readn(ctx, d, 3U) != 3U) return BAD_ERR_DATA;
 
 ```
-with open(args.input, 'rb') as f:
-    raw = f.read()
+uint8_t runs[4];
+runs[0] = (uint8_t)BAD_RLE4_R0(d[0]);
+runs[1] = (uint8_t)BAD_RLE4_R1(d[0],d[1]);
+runs[2] = (uint8_t)BAD_RLE4_R2(d[1],d[2]);
+runs[3] = (uint8_t)BAD_RLE4_R3(d[2]);
 
-try:
-    w, h, blk, total_f, hdr_size = decode_header(raw)
-except ValueError as e:
-    print(f"Header error: {e}"); sys.exit(1)
-
-st_i   = int(args.start)
-pad    = len(args.start)
-ed_lim = int(args.end) if args.end else st_i + total_f - 1
-decode_count = min(total_f, ed_lim - st_i + 1)
-ncpu = cpu_count()
-
-os.makedirs(args.path, exist_ok=True)
-
-print(f"\033[2J\033[H", end="")
-print(f"{C_BOLD}BadCodec v0.5.1 Decoder{C_RESET}")
-print(f"Input : {args.input}")
-print(f"Output: {os.path.join(args.path, args.suffix)}%04d.bmp")
-print(f"Frames: {total_f}  Size: {w}×{h}")
-print(f"Starting Decode...")
-time.sleep(0.3)
-print(f"\033[2J\033[H", end="")
-
-# Parse stream into per-frame byte slices
-stream  = raw[hdr_size:]
-ptr     = 0
-frame_slices = []
-for _ in range(total_f):
-    if ptr >= len(stream):
-        break
-    sz = frame_data_size(stream, ptr, w, h)
-    frame_slices.append(stream[ptr:ptr + sz])
-    ptr += sz
-
-# Sequential decode (frame-order dependency)
-prev_f = np.zeros((h, w), dtype=np.uint8)
-for i, fdata in enumerate(frame_slices):
-    if i >= decode_count:
-        break
-
-    decoded  = decode_frame(fdata, prev_f, w, h)
-    frame_no = st_i + i
-    out_path = os.path.join(args.path, f"{args.suffix}{frame_no:0{pad}d}.bmp")
-
-    Image.fromarray((decoded * 255).astype(np.uint8), mode='L').save(out_path)
-    prev_f = decoded.copy()
-
-    p_rat = (i + 1) / total_f
-    sys.stdout.write('\033[H')
-    print(f"{C_BOLD}BadCodec v0.5.1 Decoder{C_RESET}"
-          f"  [{ncpu} cores available]")
-    print(_bar_block(p_rat))
-    print(f"Frame: {frame_no:04d} / {st_i + total_f - 1} | "
-          f"Written: {out_path}")
-    print()
-
-print(f"\n{C_BOLD}Decode Complete.{C_RESET}"
-      f"  ({decode_count} frames → {args.path}/)")
+apply_rle_runs(ctx, bx, by,
+               BAD_RLE4_PATTERN(op),
+               BAD_RLE4_START_COLOR(op),
+               runs, 4U);
+return BAD_OK;
 ```
 
-# ============================================================
+}
 
-# CLI
+/* ============================================================
 
-# ============================================================
+- Internal: RLE_BLOCK_8 decode  (SPEC.md 6-6)
+- 6 data bytes, 8 runs max
+- ============================================================ */
 
-def main():
-p = argparse.ArgumentParser(description=“BadCodec v0.5.1”)
-p.add_argument(’-t’, ‘–task’,   choices=[‘e’,‘d’], required=True,
-help=“e=encode  d=decode”)
-p.add_argument(’-p’, ‘–path’,   required=True,
-help=“BMP directory (encode:input / decode:output)”)
-p.add_argument(’-n’, ‘–suffix’, default=‘frame_’,
-help=“Filename prefix (default: frame_)”)
-p.add_argument(’-s’, ‘–start’,  default=‘0001’,
-help=“Start frame number (default: 0001)”)
-p.add_argument(’-e’, ‘–end’,    default=None,
-help=“End frame number (required for encode)”)
-p.add_argument(’-o’, ‘–output’, default=‘output.bad’,
-help=“Output .bad file (default: output.bad)”)
-p.add_argument(’-i’, ‘–input’,  default=None,
-help=“Input .bad file (decode only)”)
-args = p.parse_args()
+static bad_result_t decode_rle8(bad_ctx_t *ctx,
+uint8_t bx, uint8_t by,
+uint8_t op)
+{
+uint8_t d[6];
+if (bad_readn(ctx, d, 6U) != 6U) return BAD_ERR_DATA;
 
 ```
-if args.task == 'e':
-    if not args.end:
-        print("Error: -e is required for encode."); sys.exit(1)
-    do_encode(args)
-else:
-    do_decode(args)
+uint8_t runs[8];
+runs[0] = (uint8_t)BAD_RLE8_R0(d[0]);
+runs[1] = (uint8_t)BAD_RLE8_R1(d[0],d[1]);
+runs[2] = (uint8_t)BAD_RLE8_R2(d[1],d[2]);
+runs[3] = (uint8_t)BAD_RLE8_R3(d[2]);
+runs[4] = (uint8_t)BAD_RLE8_R4(d[3]);
+runs[5] = (uint8_t)BAD_RLE8_R5(d[3],d[4]);
+runs[6] = (uint8_t)BAD_RLE8_R6(d[4],d[5]);
+runs[7] = (uint8_t)BAD_RLE8_R7(d[5]);
+
+apply_rle_runs(ctx, bx, by,
+               BAD_RLE8_PATTERN(op),
+               BAD_RLE8_START_COLOR(op),
+               runs, 8U);
+return BAD_OK;
 ```
 
-if **name** == ‘**main**’:
-main()
+}
+
+/* ============================================================
+
+- Internal: XOR_BLOCK decode  (SPEC.md 6-9)
+- opcode(1) + length(1) + RLE_data(N)
+- curr = prev XOR mask
+- ============================================================ */
+
+static bad_result_t decode_xor_block(bad_ctx_t *ctx,
+uint8_t bx, uint8_t by)
+{
+uint8_t xor_len = bad_read1(ctx);
+uint8_t bit_idx = 0U;
+uint8_t i;
+
+```
+for (i = 0U; i < xor_len && bit_idx < BAD_BLOCK_PIXELS; i++) {
+    uint8_t b       = bad_read1(ctx);
+    uint8_t mask_v  = BAD_XOR_MASK_VAL(b);
+    uint8_t run_len = BAD_XOR_RUN_LEN(b);
+    uint8_t k;
+    for (k = 0U; k < run_len && bit_idx < BAD_BLOCK_PIXELS; k++, bit_idx++) {
+        /* bit_idx maps to block pixel in row-major order */
+        uint8_t py = bit_idx >> 3U;
+        uint8_t px = bit_idx &  7U;
+        uint16_t gi = blk_bit(ctx, bx, by, px, py);
+        uint8_t pv  = gp_get(ctx->prev, gi);
+        gp_set(ctx->gram, gi, pv ^ mask_v);
+    }
+}
+return BAD_OK;
+```
+
+}
+
+/* ============================================================
+
+- Internal: SHIFT_BIT decode  (SPEC.md 6-3)
+- local stack: rows[8] = 8 bytes  AVR safe
+- ============================================================ */
+
+static void decode_shift_bit(bad_ctx_t *ctx,
+uint8_t bx, uint8_t by,
+uint8_t op)
+{
+uint8_t rows[BAD_BLOCK_SIZE];
+uint8_t r, c;
+
+```
+for (r = 0U; r < BAD_BLOCK_SIZE; r++) {
+    rows[r] = 0U;
+    for (c = 0U; c < BAD_BLOCK_SIZE; c++) {
+        if (gp_get(ctx->prev, blk_bit(ctx, bx, by, c, r)))
+            rows[r] |= (uint8_t)(1U << c);
+    }
+}
+
+uint8_t mag_x = BAD_SHIFT_MAG_X(op);
+if (mag_x > 0U) {
+    uint8_t sh = mag_x;
+    if (BAD_SHIFT_SIGN_X(op) == 0U) {
+        for (r = 0U; r < BAD_BLOCK_SIZE; r++) {
+            uint8_t pad = (rows[r]&0x80U) ? (uint8_t)(0xFFU<<(8U-sh)) : 0U;
+            rows[r] = (uint8_t)((rows[r]<<sh)|(pad>>(8U-sh)));
+        }
+    } else {
+        for (r = 0U; r < BAD_BLOCK_SIZE; r++) {
+            uint8_t pad = (rows[r]&0x01U) ? (uint8_t)(0xFFU>>(8U-sh)) : 0U;
+            rows[r] = (uint8_t)((rows[r]>>sh)|(pad<<(8U-sh)));
+        }
+    }
+}
+
+uint8_t mag_y = BAD_SHIFT_MAG_Y(op);
+if (mag_y > 0U) {
+    uint8_t i;
+    if (BAD_SHIFT_SIGN_Y(op) == 0U) {
+        uint8_t edge = rows[BAD_BLOCK_SIZE-1U];
+        for (i = BAD_BLOCK_SIZE-1U; i >= mag_y; i--) rows[i] = rows[i-mag_y];
+        for (i = 0U; i < mag_y; i++) rows[i] = edge;
+    } else {
+        uint8_t edge  = rows[0U];
+        uint8_t limit = (uint8_t)(BAD_BLOCK_SIZE-mag_y);
+        for (i = 0U; i < limit; i++) rows[i] = rows[i+mag_y];
+        for (i = limit; i < BAD_BLOCK_SIZE; i++) rows[i] = edge;
+    }
+}
+
+for (r = 0U; r < BAD_BLOCK_SIZE; r++)
+    for (c = 0U; c < BAD_BLOCK_SIZE; c++)
+        gp_set(ctx->gram, blk_bit(ctx,bx,by,c,r), (rows[r]>>c)&1U);
+```
+
+}
+
+/* ============================================================
+
+- Internal: fill / copy / invert one block
+- ============================================================ */
+
+static void fill_block(bad_ctx_t *ctx, uint8_t bx, uint8_t by, uint8_t color)
+{
+uint8_t px, py;
+for (py=0U; py<BAD_BLOCK_SIZE; py++)
+for (px=0U; px<BAD_BLOCK_SIZE; px++)
+gp_set(ctx->gram, blk_bit(ctx,bx,by,px,py), color);
+}
+
+static void copy_block(bad_ctx_t *ctx, uint8_t bx, uint8_t by)
+{
+uint8_t px, py;
+for (py=0U; py<BAD_BLOCK_SIZE; py++)
+for (px=0U; px<BAD_BLOCK_SIZE; px++) {
+uint16_t idx = blk_bit(ctx,bx,by,px,py);
+gp_set(ctx->gram, idx, gp_get(ctx->prev, idx));
+}
+}
+
+static void invert_block(bad_ctx_t *ctx, uint8_t bx, uint8_t by)
+{
+uint8_t px, py;
+for (py=0U; py<BAD_BLOCK_SIZE; py++)
+for (px=0U; px<BAD_BLOCK_SIZE; px++) {
+uint16_t idx = blk_bit(ctx,bx,by,px,py);
+gp_set(ctx->gram, idx, gp_get(ctx->prev,idx)^1U);
+}
+}
+
+/* ============================================================
+
+- Internal: BLOCK_STREAM decode  (SPEC.md 7-7)
+- FOR nest forbidden.
+- ============================================================ */
+
+static bad_result_t decode_block_stream(bad_ctx_t *ctx)
+{
+uint8_t  nbx   = blk_nx(ctx);
+uint16_t total = (uint16_t)nbx * (uint16_t)blk_ny(ctx);
+uint16_t ptr   = 0U;
+bad_result_t ret;
+
+```
+while (ptr < total) {
+    uint8_t op = bad_read1(ctx);
+
+    /* FOR */
+    if (BAD_IS_FOR(op)) {
+        uint8_t repeat = (uint8_t)BAD_FOR_COUNT(op);
+        uint8_t iop    = bad_read1(ctx);
+        uint8_t fi;
+        for (fi = 0U; fi < repeat && ptr < total; fi++) {
+            uint8_t bx = (uint8_t)(ptr % nbx);
+            uint8_t by = (uint8_t)(ptr / nbx);
+            if (BAD_IS_SKIP(iop)) {
+                uint8_t cnt = (uint8_t)BAD_SKIP_COUNT(iop);
+                while (cnt-- && ptr < total) {
+                    copy_block(ctx,(uint8_t)(ptr%nbx),(uint8_t)(ptr/nbx));
+                    ptr++;
+                }
+            } else if (BAD_IS_INVERT(iop)) {
+                uint8_t cnt = (uint8_t)BAD_INVERT_COUNT(iop);
+                while (cnt-- && ptr < total) {
+                    invert_block(ctx,(uint8_t)(ptr%nbx),(uint8_t)(ptr/nbx));
+                    ptr++;
+                }
+            } else if (BAD_IS_FILL(iop)) {
+                uint8_t col = BAD_FILL_COLOR(iop);
+                uint8_t cnt = (uint8_t)BAD_FILL_COUNT(iop);
+                while (cnt-- && ptr < total) {
+                    fill_block(ctx,(uint8_t)(ptr%nbx),(uint8_t)(ptr/nbx),col);
+                    ptr++;
+                }
+            } else if (BAD_IS_SHIFT(iop)) {
+                decode_shift_bit(ctx, bx, by, iop);
+                ptr++;
+            } else {
+                return BAD_ERR_DATA;
+            }
+        }
+        continue;
+    }
+
+    uint8_t bx = (uint8_t)(ptr % nbx);
+    uint8_t by = (uint8_t)(ptr / nbx);
+
+    if (BAD_IS_SKIP(op)) {
+        uint8_t cnt = (uint8_t)BAD_SKIP_COUNT(op);
+        while (cnt-- && ptr < total) {
+            copy_block(ctx,(uint8_t)(ptr%nbx),(uint8_t)(ptr/nbx));
+            ptr++;
+        }
+    } else if (BAD_IS_INVERT(op)) {
+        uint8_t cnt = (uint8_t)BAD_INVERT_COUNT(op);
+        while (cnt-- && ptr < total) {
+            invert_block(ctx,(uint8_t)(ptr%nbx),(uint8_t)(ptr/nbx));
+            ptr++;
+        }
+    } else if (BAD_IS_FILL(op)) {
+        uint8_t col = BAD_FILL_COLOR(op);
+        uint8_t cnt = (uint8_t)BAD_FILL_COUNT(op);
+        while (cnt-- && ptr < total) {
+            fill_block(ctx,(uint8_t)(ptr%nbx),(uint8_t)(ptr/nbx),col);
+            ptr++;
+        }
+    } else if (BAD_IS_SHIFT(op)) {
+        decode_shift_bit(ctx, bx, by, op);
+        ptr++;
+    } else if (BAD_IS_RLE4(op)) {
+        ret = decode_rle4(ctx, bx, by, op);
+        if (ret != BAD_OK) return ret;
+        ptr++;
+    } else if (BAD_IS_RLE8(op)) {
+        ret = decode_rle8(ctx, bx, by, op);
+        if (ret != BAD_OK) return ret;
+        ptr++;
+    } else if (op == BAD_OP_MASTER_BLOCK) {
+        ret = decode_master_block(ctx, bx, by);
+        if (ret != BAD_OK) return ret;
+        ptr++;
+    } else if (op == BAD_OP_XOR_BLOCK) {
+        ret = decode_xor_block(ctx, bx, by);
+        if (ret != BAD_OK) return ret;
+        ptr++;
+    } else {
+        return BAD_ERR_DATA;
+    }
+}
+return BAD_OK;
+```
+
+}
+
+/* ============================================================
+
+- Internal: RLE_FRAME decode  (SPEC.md 7-6)
+- Writes directly to gram via scan-order loop.
+- No intermediate pixel buffer needed -> AVR 2KB safe.
+- ============================================================ */
+
+static bad_result_t decode_rle_frame(bad_ctx_t *ctx, uint8_t op)
+{
+uint8_t scan_dir = BAD_RLF_SCAN_DIR(op);
+uint8_t start_y  = BAD_RLF_START_Y(op);
+uint8_t start_x  = BAD_RLF_START_X(op);
+uint16_t w = ctx->width;
+uint16_t h = ctx->height;
+int16_t sx = start_x ? (int16_t)(w-1U) : 0;
+int16_t sy = start_y ? (int16_t)(h-1U) : 0;
+int8_t  dx = start_x ? -1 : 1;
+int8_t  dy = start_y ? -1 : 1;
+
+```
+uint8_t run_color  = 0U;
+uint8_t run_remain = 0U;
+```
+
+#define NEXT_PX(oc) do {                                        
+if (run_remain == 0U) {                                     
+uint8_t _b = bad_read1(ctx);                            
+if (_b == 0x00U) return BAD_ERR_DATA;                   
+run_color  = BAD_RLEFRAME_COLOR(_b);                    
+run_remain = (uint8_t)BAD_RLEFRAME_LEN(_b);            
+if (run_remain == 0U) return BAD_ERR_DATA;              
+}                                                           
+(oc) = run_color; run_remain–;                             
+} while(0)
+
+```
+if (scan_dir == 0U) {
+    int16_t y;
+    for (y=sy; dy>0?(y<(int16_t)h):(y>=0); y+=dy) {
+        int16_t x;
+        for (x=sx; dx>0?(x<(int16_t)w):(x>=0); x+=dx) {
+            uint8_t c; NEXT_PX(c);
+            gp_set(ctx->gram,(uint16_t)y*w+(uint16_t)x, c);
+        }
+    }
+} else {
+    int16_t x;
+    for (x=sx; dx>0?(x<(int16_t)w):(x>=0); x+=dx) {
+        int16_t y;
+        for (y=sy; dy>0?(y<(int16_t)h):(y>=0); y+=dy) {
+            uint8_t c; NEXT_PX(c);
+            gp_set(ctx->gram,(uint16_t)y*w+(uint16_t)x, c);
+        }
+    }
+}
+```
+
+#undef NEXT_PX
+return BAD_OK;
+}
+
+/* ============================================================
+
+- Internal: MASTER_FRAME decode  (SPEC.md 7-5)
+- ============================================================ */
+
+static bad_result_t decode_master_frame(bad_ctx_t *ctx)
+{
+uint16_t sz = BAD_GRAM_SIZE(ctx->width, ctx->height);
+if (bad_readn(ctx, ctx->gram, sz) != sz) return BAD_ERR_DATA;
+return BAD_OK;
+}
+
+/* skip FRAME_DELIMITER(0x38) bytes and return the next opcode */
+static uint8_t read_frame_op(bad_ctx_t *ctx)
+{
+uint8_t op;
+do { op = bad_read1(ctx); } while (op == BAD_OP_FRAME_DELIMITER);
+return op;
+}
+
+/* ============================================================
+
+- Public API: bad_init
+- ============================================================ */
+
+bad_result_t bad_init(bad_ctx_t *ctx)
+{
+if (!ctx || !ctx->read || !ctx->gram || !ctx->prev || !ctx->buf_size)
+return BAD_ERR_ARG;
+
+```
+uint8_t  hdr[BAD_HEADER_SIZE];
+uint16_t n = ctx->read(0U, hdr, BAD_HEADER_SIZE);
+if (n < BAD_HEADER_SIZE) return BAD_ERR_HDR;
+
+uint16_t hdr_size   = (uint16_t)(((uint16_t)hdr[1]<<8U)|hdr[0]);
+if (hdr_size != BAD_HEADER_SIZE) return BAD_ERR_HDR;
+
+uint16_t stored_chk = (uint16_t)(((uint16_t)hdr[3]<<8U)|hdr[2]);
+if (stored_chk != fletcher16(&hdr[4], BAD_HEADER_BODY_SIZE))
+    return BAD_ERR_HDR;
+
+if (hdr[4]!=(uint8_t)'B'||hdr[5]!=(uint8_t)'a'||hdr[6]!=(uint8_t)'d')
+    return BAD_ERR_MAGIC;
+
+/* body layout:
+ *  hdr[4..6]  "Bad"
+ *  hdr[7..8]  version
+ *  hdr[9..10] colors
+ *  hdr[11..12] width
+ *  hdr[13..14] height
+ *  hdr[15..16] blksize
+ *  hdr[17..18] total_frames
+ */
+ctx->width        = (uint16_t)(((uint16_t)hdr[12]<<8U)|hdr[11]);
+ctx->height       = (uint16_t)(((uint16_t)hdr[14]<<8U)|hdr[13]);
+ctx->total_frames = (uint16_t)(((uint16_t)hdr[18]<<8U)|hdr[17]);
+
+if (ctx->buf_size < BAD_GRAM_SIZE(ctx->width, ctx->height))
+    return BAD_ERR_MEM;
+
+ctx->stream_offset = BAD_HEADER_SIZE;
+ctx->current_frame = 0U;
+ctx->initialized   = 1U;
+bad_memset(ctx->prev, 0x00U, BAD_GRAM_SIZE(ctx->width, ctx->height));
+return BAD_OK;
+```
+
+}
+
+/* ============================================================
+
+- Public API: bad_next_frame
+- ============================================================ */
+
+bad_result_t bad_next_frame(bad_ctx_t *ctx)
+{
+if (!ctx || !ctx->initialized) return BAD_ERR_ARG;
+if (ctx->current_frame >= ctx->total_frames) return BAD_EOF;
+
+```
+swap_to_prev(ctx);
+uint8_t op = read_frame_op(ctx);
+bad_result_t ret = BAD_OK;
+
+switch (op) {
+
+case BAD_OP_SKIP_FRAME:
+    bad_memcpy(ctx->gram, ctx->prev,
+               BAD_GRAM_SIZE(ctx->width, ctx->height));
+    break;
+
+case BAD_OP_FILL_BLACK:
+    fill_frame(ctx, 0U);
+    break;
+
+case BAD_OP_FILL_WHITE:
+    fill_frame(ctx, 1U);
+    break;
+
+case BAD_OP_INVERT_PREV: {
+    uint16_t sz = BAD_GRAM_SIZE(ctx->width, ctx->height);
+    uint16_t i;
+    for (i=0U; i<sz; i++) ctx->gram[i]=(uint8_t)~ctx->prev[i];
+    break;
+}
+
+case BAD_OP_MASTER_FRAME:
+    ret = decode_master_frame(ctx);
+    break;
+
+/* RLE_FRAME: 0x30-0x37 */
+case 0x30U: case 0x31U: case 0x32U: case 0x33U:
+case 0x34U: case 0x35U: case 0x36U: case 0x37U:
+    ret = decode_rle_frame(ctx, op);
+    break;
+
+case BAD_OP_BLOCK_STREAM:
+    ret = decode_block_stream(ctx);
+    break;
+
+case BAD_OP_EXT_PREFIX:
+    (void)bad_read1(ctx);   /* consume sub-command; skip */
+    bad_memcpy(ctx->gram, ctx->prev,
+               BAD_GRAM_SIZE(ctx->width, ctx->height));
+    break;
+
+default:
+    ret = BAD_ERR_DATA;
+    break;
+}
+
+if (ret == BAD_OK) {
+    ctx->current_frame++;
+    if (ctx->current_frame >= ctx->total_frames) ret = BAD_EOF;
+}
+return ret;
+```
+
+}
+
+/* ============================================================
+
+- Public API: bad_rewind
+- ============================================================ */
+
+bad_result_t bad_rewind(bad_ctx_t *ctx)
+{
+if (!ctx || !ctx->initialized) return BAD_ERR_ARG;
+ctx->stream_offset = BAD_HEADER_SIZE;
+ctx->current_frame = 0U;
+bad_memset(ctx->prev, 0x00U,
+BAD_GRAM_SIZE(ctx->width, ctx->height));
+return BAD_OK;
+}
+
+/* ============================================================
+
+- Public API: bad_seek
+- ============================================================ */
+
+bad_result_t bad_seek(bad_ctx_t *ctx, uint16_t frame_no)
+{
+if (!ctx || !ctx->initialized) return BAD_ERR_ARG;
+if (frame_no >= ctx->total_frames) return BAD_EOF;
+
+```
+bad_result_t ret = bad_rewind(ctx);
+if (ret != BAD_OK) return ret;
+
+while (ctx->current_frame < frame_no) {
+    ret = bad_next_frame(ctx);
+    if (ret != BAD_OK && ret != BAD_EOF) return ret;
+}
+return BAD_OK;
+```
+
+}
+
+/* ============================================================
+
+- Public API: bad_result_str  (debug only - omit to save Flash)
+- ============================================================ */
+
+const char *bad_result_str(bad_result_t result)
+{
+switch (result) {
+case BAD_OK:        return “BAD_OK”;
+case BAD_BUSY:      return “BAD_BUSY”;
+case BAD_EOF:       return “BAD_EOF”;
+case BAD_ERR_HDR:   return “BAD_ERR_HDR”;
+case BAD_ERR_MAGIC: return “BAD_ERR_MAGIC”;
+case BAD_ERR_DATA:  return “BAD_ERR_DATA”;
+case BAD_ERR_MEM:   return “BAD_ERR_MEM”;
+case BAD_ERR_ARG:   return “BAD_ERR_ARG”;
+default:            return “BAD_ERR_UNKNOWN”;
+}
+}
