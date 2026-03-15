@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BadCodec v0.5.1
+BadCodec v0.5.5
 Based on BadCodec 完全実装仕様書 rev.11
   - MD5 -> Fletcher-16 に変更(マイコン向け最低解)
 
@@ -89,7 +89,7 @@ OP_XOR_BLOCK_B = 0x3F
 # Constants
 # ============================================================
 BLOCK_SIZE = 8
-VERSION    = 514   # protocol version rev.16: DELTA_FRAME + full candidate comparison
+VERSION    = 055   # protocol version rev.16: DELTA_FRAME + full candidate comparison
 
 # ============================================================
 # Fletcher-16  (仕様書 3-3節)
