@@ -88,8 +88,9 @@ OP_XOR_BLOCK_B = 0x3F
 # ============================================================
 # Constants
 # ============================================================
-BLOCK_SIZE = 8
-VERSION    = 514   # protocol version rev.16: DELTA_FRAME + full candidate comparison
+BLOCK_SIZE   = 8
+VERSION      = 514       # protocol version rev.18
+APP_VERSION  = "0.5.5"  # application version (C header export added)
 
 # ============================================================
 # Fletcher-16  (仕様書 3-3節)
@@ -1424,13 +1425,134 @@ def do_decode(args):
           f"  ({decode_count} frames → {args.path}/)")
 
 # ============================================================
+# C Header exporter  (-t c)
+# ============================================================
+def _c_ident(name):
+    """ファイル名から有効な C 識別子を生成する"""
+    import re
+    base = os.path.splitext(os.path.basename(name))[0]
+    ident = re.sub(r'[^0-9A-Za-z_]', '_', base)
+    if ident and ident[0].isdigit():
+        ident = '_' + ident
+    return ident or 'bad_data'
+
+def do_c_header(args):
+    """
+    .bad ファイルを C 言語ヘッダファイルに変換する。
+
+    出力形式:
+      #ifndef UPPER_NAME_H
+      #define UPPER_NAME_H
+
+      #include <stdint.h>
+      #include <avr/pgmspace.h>  // AVR のみ
+
+      // メタデータ定数 (ヘッダから取得)
+      #define ARRAY_NAME_WIDTH   128
+      #define ARRAY_NAME_HEIGHT   64
+      #define ARRAY_NAME_FRAMES 6572
+      #define ARRAY_NAME_SIZE   972231
+
+      #ifdef __AVR__
+      const uint8_t ARRAY_NAME[] PROGMEM = {
+      #else
+      const uint8_t ARRAY_NAME[] = {
+      #endif
+          0x13, 0x00, ...
+      };
+
+      #endif // UPPER_NAME_H
+    """
+    if not args.input:
+        print("Error: -i is required for -t c."); sys.exit(1)
+    if not args.H:
+        print("Error: -H is required for -t c."); sys.exit(1)
+    if not os.path.exists(args.input):
+        print(f"Error: {args.input} not found."); sys.exit(1)
+
+    # 配列名の決定: -n が指定されていれば使用、なければファイル名から生成
+    # -t c では -n を「配列名」として流用する
+    with open(args.input, 'rb') as f:
+        raw = f.read()
+
+    # ヘッダ解析してメタデータを取得
+    try:
+        w, h, blk, total_f, hdr_size = decode_header(raw)
+    except ValueError as e:
+        print(f"Header error: {e}"); sys.exit(1)
+
+    # 配列名・ヘッダガード名の決定
+    array_name  = _c_ident(args.H)
+    guard_name  = array_name.upper() + '_H'
+    file_size   = len(raw)
+
+    # 1行あたりのバイト数
+    BYTES_PER_LINE = 16
+
+    lines = []
+    lines.append(f"#ifndef {guard_name}")
+    lines.append(f"#define {guard_name}")
+    lines.append("")
+    lines.append("#include <stdint.h>")
+    lines.append("")
+    lines.append("/* BadCodec v{ver} / Protocol {proto} */".format(
+        ver=APP_VERSION, proto=VERSION))
+    lines.append(f"#define {array_name.upper()}_WIDTH   {w}U")
+    lines.append(f"#define {array_name.upper()}_HEIGHT  {h}U")
+    lines.append(f"#define {array_name.upper()}_FRAMES  {total_f}U")
+    lines.append(f"#define {array_name.upper()}_SIZE    {file_size}UL")
+    lines.append("")
+    lines.append("#ifdef __AVR__")
+    lines.append("#include <avr/pgmspace.h>")
+    lines.append(f"const uint8_t {array_name}[] PROGMEM = {{")
+    lines.append("#else")
+    lines.append(f"const uint8_t {array_name}[] = {{")
+    lines.append("#endif")
+
+    # バイト列を16バイト/行でフォーマット
+    for offset in range(0, file_size, BYTES_PER_LINE):
+        chunk   = raw[offset:offset + BYTES_PER_LINE]
+        hex_str = ', '.join(f'0x{b:02X}' for b in chunk)
+        if offset + BYTES_PER_LINE < file_size:
+            lines.append(f"    {hex_str},")
+        else:
+            lines.append(f"    {hex_str}")
+
+    lines.append("};")
+    lines.append("")
+    lines.append(f"#endif /* {guard_name} */")
+    lines.append("")
+
+    output_text = '\n'.join(lines)
+
+    with open(args.H, 'w', encoding='ascii') as f:
+        f.write(output_text)
+
+    print(f"{C_BOLD}BadCodec v{APP_VERSION} C Header Export{C_RESET}")
+    print(f"  Input  : {args.input}  ({file_size:,} bytes)")
+    print(f"  Output : {args.H}")
+    print(f"  Array  : {array_name}[]  ({file_size:,} bytes)")
+    print(f"  Image  : {w}x{h}  {total_f} frames")
+    print(f"  Guard  : {guard_name}")
+    print(f"  PROGMEM: enabled (#ifdef __AVR__)")
+    print(f"\n{C_BOLD}Done.{C_RESET}")
+
+# ============================================================
 # CLI
 # ============================================================
 def main():
-    p = argparse.ArgumentParser(description="BadCodec v0.5.1")
-    p.add_argument('-t', '--task',   choices=['e','d'], required=True,
-                   help="e=encode  d=decode")
-    p.add_argument('-p', '--path',   required=True,
+    p = argparse.ArgumentParser(
+        description=f"BadCodec v{APP_VERSION} (Protocol {VERSION})",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Encode:   Codec.py -t e -p ./frames -n frame_ -s 0001 -e 6572 -o out.bad
+  Decode:   Codec.py -t d -i out.bad  -p ./out   -n frame_ -s 0001
+  C Header: Codec.py -t c -i out.bad  -H video.h
+""")
+    p.add_argument('-t', '--task',   choices=['e','d','c'], required=True,
+                   help="e=encode  d=decode  c=C header export")
+    p.add_argument('-p', '--path',   default=None,
                    help="BMP directory (encode:input / decode:output)")
     p.add_argument('-n', '--suffix', default='frame_',
                    help="Filename prefix (default: frame_)")
@@ -1441,15 +1563,23 @@ def main():
     p.add_argument('-o', '--output', default='output.bad',
                    help="Output .bad file (default: output.bad)")
     p.add_argument('-i', '--input',  default=None,
-                   help="Input .bad file (decode only)")
+                   help="Input .bad file (decode / C header)")
+    p.add_argument('-H', '--H',      default=None, dest='H',
+                   help="Output C header filename (e.g. video.h)  [-t c]")
     args = p.parse_args()
 
     if args.task == 'e':
         if not args.end:
             print("Error: -e is required for encode."); sys.exit(1)
+        if not args.path:
+            print("Error: -p is required for encode."); sys.exit(1)
         do_encode(args)
-    else:
+    elif args.task == 'd':
+        if not args.path:
+            print("Error: -p is required for decode."); sys.exit(1)
         do_decode(args)
+    else:  # 'c'
+        do_c_header(args)
 
 if __name__ == '__main__':
     main()
