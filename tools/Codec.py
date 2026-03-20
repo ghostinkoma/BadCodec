@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BadCodec v0.5.5
+BadCodec v0.5.1
 Based on BadCodec 完全実装仕様書 rev.11
   - MD5 -> Fletcher-16 に変更(マイコン向け最低解)
 
@@ -89,7 +89,7 @@ OP_XOR_BLOCK_B = 0x3F
 # Constants
 # ============================================================
 BLOCK_SIZE = 8
-VERSION    = 055   # protocol version rev.16: DELTA_FRAME + full candidate comparison
+VERSION    = 514   # protocol version rev.16: DELTA_FRAME + full candidate comparison
 
 # ============================================================
 # Fletcher-16  (仕様書 3-3節)
@@ -707,6 +707,16 @@ def decode_frame(data, prev_f, w, h):
     n_blk  = bx * by_cnt
     op     = data[0]
 
+    # Frame-level FOR: 0xC0-0xFF
+    # merge_frame_for が生成する FOR(n)+SINGLE_BYTE_OP の形式
+    # repeat は呼び出し元(do_decode)が管理するため
+    # ここでは inner_op を1回分デコードして返すだけで正しい
+    if (op & 0xC0) == 0xC0:
+        if len(data) < 2:
+            raise ValueError(f"Frame-level FOR: insufficient data")
+        inner_op = data[1]
+        return decode_frame(bytes([inner_op]), prev_f, w, h)
+
     if op == OP_SKIP_FRAME:
         return prev_f.copy()
     if op == OP_FRAME_FILL_BLACK:
@@ -914,6 +924,10 @@ def _decode_block_stream(stream, prev_f, w, h, bx, n_blk):
 def frame_data_size(data, offset, w, h):
     """Return byte size of one frame starting at data[offset]."""
     op = data[offset]
+    # Frame-level FOR: 0xC0-0xFF
+    # merge_frame_for が生成する FOR(n)+SINGLE_BYTE_OP = 2バイト固定
+    if (op & 0xC0) == 0xC0:
+        return 2
     # Fixed 1-byte frames
     if op in (OP_SKIP_FRAME, OP_FRAME_FILL_BLACK,
               OP_FRAME_FILL_WHITE, OP_INVERT_PREV):
@@ -1201,16 +1215,16 @@ def merge_frame_for(ordered_frames):
             rem = count
             while rem > 0:
                 take = min(rem, 65)
-                if take <= 3:
-                    # FOR 0・1 禁止 → 個別に書く
+                if take < 4:
+                    # FOR禁止ルール: repeat<4 は生成禁止 → 個別に書く
                     for k in range(take):
                         out.extend([op])
                         display.append((bytes([op]), types))
                 else:
-                    # FOR (take-2) + op の2バイトで表現
+                    # FOR(0xC2以上) + op の2バイトで表現
+                    # 最小有効値: take=4 → 0xC2
                     for_byte = 0xC0 | (take - 2)
                     out.extend([for_byte, op])
-                    # display は FOR対象フレームをまとめて1エントリとして記録
                     display.append((bytes([for_byte, op]), types))
                 rem -= take
             i = j
