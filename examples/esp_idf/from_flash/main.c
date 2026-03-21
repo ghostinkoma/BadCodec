@@ -1,6 +1,7 @@
 /**
  * @file  main.c
  * @brief BadCodec サンプル: ESP-IDF / ヘッダファイル (bad_data.h) から再生
+ * @version v0.6.0  (Protocol 514, SPEC rev.19)
  *
  * ビルド方法 (ESP-IDF 5.x):
  *   idf.py build flash monitor
