@@ -1,6 +1,7 @@
 /**
  * @file  main.c
  * @brief BadCodec サンプル: ESP-IDF / SD カードから再生
+ * @version v0.6.0  (Protocol 514, SPEC rev.19)
  *
  * SD カード: SDMMC (1-line) または SPI 接続
  * ディスプレイ: SSD1306 128x64 (esp-idf-lib)
