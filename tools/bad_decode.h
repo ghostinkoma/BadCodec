@@ -1,7 +1,7 @@
 /**
  * @file    bad_decode.h
- * @brief   BadCodec v0.5.5 - Decoder for 8/32-bit MCU
- * @version 0.5.5  (Protocol: 055)
+ * @brief   BadCodec v0.5.1 - Decoder for 8/32-bit MCU
+ * @version 0.5.1  (Protocol: 514)
  * @date    2026-03-15
  * @license Non-Commercial Use Only  ghostinkoma@gmail.com
  *
@@ -24,6 +24,7 @@
  *   512 : RLE_FRAME x8 scan patterns (0x30-0x37)
  *   513 : RLE_BLOCK_8 (0x38-0x3B,0x3D-0x3E) + XOR_BLOCK (0x3F)
  *   514 : DELTA_FRAME (0x3D) frame-level XOR diff + FOR min repeat=4
+ *   514r19: FOR min repeat changed 4->3 (0xC1 now valid encoder output)
  */
 
 #ifndef BAD_DECODE_H
@@ -133,9 +134,9 @@
 #define BAD_SKIP_COUNT(op)       (((op)&0x3FU)+1U)
 
 /* FOR  11nnnnnn  0xC0-0xFF  repeat=n+2
- * Encoder must NOT generate 0xC0 (repeat=2) or 0xC1 (repeat=3).
- * Minimum valid encoder output: 0xC2 (repeat=4).
- * Decoder handles all values including 0xC0 and 0xC1. */
+ * Encoder must NOT generate 0xC0 (repeat=2): FOR+CMD=2B = literal x2=2B, pointless.
+ * Encoder minimum valid output: 0xC1 (repeat=3): FOR+CMD=2B < literal x3=3B.
+ * Decoder handles all values including 0xC0 gracefully.  (SPEC.md rev.19) */
 #define BAD_IS_FOR(op)           (((op)&0xC0U)==0xC0U)
 #define BAD_FOR_COUNT(op)        (((op)&0x3FU)+2U)
 
@@ -235,15 +236,20 @@
 #define BAD_XOR_RUN_LEN(b)   ( (b)      &0x7FU)
 
 /* ============================================================
- * FOR encoder constraint  (SPEC.md 9-2)
+ * FOR encoder constraint  (SPEC.md 9-2, rev.19)
  *
- * Encoder minimum repeat count = 4 (opcode 0xC2).
- * FOR repeat=2 (0xC0) and repeat=3 (0xC1) are FORBIDDEN
- * from encoder output. Decoder handles them gracefully.
+ * Encoder minimum repeat count = 3 (opcode 0xC1).
+ *   repeat=2 (0xC0): FOR+CMD=2B == literal x2=2B  -> FORBIDDEN (pointless)
+ *   repeat=3 (0xC1): FOR+CMD=2B  < literal x3=3B  -> VALID (saves 1B)
+ *   repeat=4 (0xC2): FOR+CMD=2B  < literal x4=4B  -> VALID (saves 2B)
+ *   ...
+ * Maximum repeat = 65 (0xFF): physical limit of 6-bit field (63+2=65).
+ * repeat=66 would require bit value 64 = 0x40 (7 bits) -- impossible.
+ * Decoder handles 0xC0 (repeat=2) gracefully.
  * ============================================================ */
 
-#define BAD_FOR_MIN_REPEAT   ((uint8_t)4U)
-#define BAD_FOR_MIN_OPCODE   ((uint8_t)0xC2U)
+#define BAD_FOR_MIN_REPEAT   ((uint8_t)3U)
+#define BAD_FOR_MIN_OPCODE   ((uint8_t)0xC1U)
 #define BAD_FOR_MAX_REPEAT   ((uint8_t)65U)
 #define BAD_FOR_MAX_OPCODE   ((uint8_t)0xFFU)
 
