@@ -1,7 +1,7 @@
 /**
  * @file    bad_decode.cpp
- * @brief   BadCodec v0.5.5 - Decoder implementation
- * @version 0.5.5  (Protocol: 055)
+ * @brief   BadCodec v0.5.1 - Decoder implementation
+ * @version 0.5.1  (Protocol: 514)
  * @date    2026-03-15
  * @license Non-Commercial Use Only  ghostinkoma@gmail.com
  *
@@ -15,6 +15,7 @@
  * Changelog:
  *   rev.16: DELTA_FRAME (0x3D) decode added
  *   rev.18: FOR min repeat=4 documented (decoder unchanged)
+ *   rev.19: FOR min repeat changed 4->3 (0xC1 now valid); constants updated
  */
 
 #include "bad_decode.h"
@@ -361,8 +362,9 @@ static bad_result_t decode_block_stream(bad_ctx_t *ctx)
     while (ptr < total) {
         uint8_t op = bad_read1(ctx);
 
-        /* FOR: decoder handles all repeat values including 2,3
-         * (encoder must not generate repeat<4, but decoder is tolerant) */
+        /* FOR: decoder handles all repeat values including 0xC0 (repeat=2).
+         * Encoder min is 0xC1 (repeat=3) since rev.19; 0xC0 is forbidden.
+         * Decoder is tolerant and processes any value 0xC0-0xFF correctly. */
         if (BAD_IS_FOR(op)) {
             uint8_t repeat = (uint8_t)BAD_FOR_COUNT(op);
             uint8_t iop    = bad_read1(ctx);
