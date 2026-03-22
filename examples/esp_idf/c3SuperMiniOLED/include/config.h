@@ -1,19 +1,72 @@
-# BadCodecPlayer sdkconfig.defaults
-# ESP32-C3 Super Mini / SSD1306 72x40 ビルトイン OLED
+/**
+ * @file  config.h
+ * @brief ESP32-C3 Super Mini OLED ビルトインモジュール ハードウェア定数
+ * @version v0.6.0  (Protocol 514, SPEC rev.19)
+ *
+ * このファイルだけを変更すれば全ソースに反映される。
+ *
+ * 対象ハードウェア:
+ *   ESP32-C3 Super Mini
+ *   SSD1306 OLED 72x40 ビルトイン (物理 128x64)
+ *   I2C: SDA=GPIO5 / SCL=GPIO6
+ */
 
-# FreeRTOS 1ms tick
-CONFIG_FREERTOS_HZ=1000
+#ifndef CONFIG_H
+#define CONFIG_H
 
-# Flash 4MB
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+/* ============================================================
+ * I2C
+ * ============================================================ */
+#define CFG_I2C_PORT      I2C_NUM_0
+#define CFG_I2C_SDA       5
+#define CFG_I2C_SCL       6
+#define CFG_I2C_FREQ_HZ   1000000      /* 1 MHz */
 
-# ログレベル INFO
-CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_LOG_DEFAULT_LEVEL=3
+/* ============================================================
+ * SSD1306 物理パラメータ
+ * ============================================================ */
+#define CFG_OLED_ADDR     0x3C
+#define CFG_PHYS_W        128          /* SSD1306 物理幅 */
+#define CFG_PHYS_H        64           /* SSD1306 物理高さ */
+#define CFG_PAGES         8            /* 64 / 8 */
 
-# メインタスク スタック
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+/* ============================================================
+ * OLED 実表示域 (ビルトインモジュールの有効ドット)
+ *
+ * このモジュールは 128x64 の SSD1306 を使用しているが
+ * 実際の表示パネルは 72x40 ドット。
+ * SSD1306 の列は 0〜131 の 132 列。表示パネルは中央 72 列を使用。
+ *   列オフセット = (132 - 72) / 2 = 30
+ *   しかし参考コード実測値では 27 が正しい → そのまま使用
+ * ============================================================ */
+#define CFG_DISP_W        72           /* 表示パネル幅 */
+#define CFG_DISP_H        40           /* 表示パネル高さ */
+#define CFG_X_OFFSET      27           /* SSD1306 列オフセット */
+#define CFG_Y_OFFSET      12           /* 行オフセット (64-40)/2 */
 
-# I2C
-CONFIG_I2C_ENABLE_DEBUG_LOG=n
+/* ============================================================
+ * BadCodec 動画パラメータ
+ * エンコード時の解像度と必ず一致させること:
+ *   python3 Codec.py -t e ... → 72x40 でエンコード
+ * ============================================================ */
+#define CFG_VIDEO_W       CFG_DISP_W   /* 72 */
+#define CFG_VIDEO_H       CFG_DISP_H   /* 40 */
+
+/* ============================================================
+ * フレームレート
+ * BAD_FRAME_MS = 1000 / FPS
+ *   34fps → 29ms  30fps → 33ms  24fps → 41ms
+ * ============================================================ */
+#define CFG_FRAME_MS      29           /* 約 34fps */
+
+/* ============================================================
+ * 読み込み元の選択 (どちらか一方のみ定義)
+ * ============================================================ */
+#define CFG_SOURCE_FLASH  1            /* Flash (bad_data.h) から読む */
+/* #define CFG_SOURCE_SD  1 */         /* SD カードから読む場合はこちら */
+
+#ifdef CFG_SOURCE_SD
+  #define CFG_SD_FILE     "/sdcard/output.bad"
+#endif
+
+#endif /* CONFIG_H */
