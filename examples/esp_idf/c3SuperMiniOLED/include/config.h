@@ -42,7 +42,7 @@
 #define CFG_DISP_W        72           /* 表示パネル幅 */
 #define CFG_DISP_H        40           /* 表示パネル高さ */
 #define CFG_X_OFFSET      27           /* SSD1306 列オフセット */
-#define CFG_Y_OFFSET      12           /* 行オフセット (64-40)/2 */
+#define CFG_Y_OFFSET      23           /* 行オフセット (64-40)/2 */
 
 /* ============================================================
  * BadCodec 動画パラメータ
