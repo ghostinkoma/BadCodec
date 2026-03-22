@@ -1,26 +1,24 @@
 # BadCodecPlayer
 
-**ESP32-C3 Suoer Mini + SSD1306 OLED で BadCodec 動画を再生する PlatformIO プロジェクト**
+**ESP32-C3 Super Mini (OLED 72x40 ビルトイン) で BadCodec 動画を再生する**
 
-BadCodec v0.6.0 / Protocol 514 / SPEC rev.19
+BadCodec v0.6.0 / Protocol 514 / SPEC rev.19  
+PlatformIO + ESP-IDF フレームワーク
 
 ---
 
-## ハードウェア構成
+## ハードウェア
 
 ```
-ESP32-C3 Mini
-  GPIO5 → SDA
-  GPIO6 → SCL
-  3.3V  → VCC
-  GND   → GND
-
-SSD1306 OLED (128x64 I2C)
-  物理解像度: 128x64
-  動画表示域: 72x40 (画面中央に配置)
-  I2C アドレス: 0x3C
-  I2C 速度: 1 MHz
+ESP32-C3 Super Mini OLED ビルトインモジュール
+  SSD1306 OLED  物理 128x64 / 有効表示域 72x40
+  I2C SDA : GPIO5
+  I2C SCL : GPIO6
+  ADDR    : 0x3C
+  速度    : 1 MHz
 ```
+
+**追加配線は不要です。** OLED はモジュールに内蔵されています。
 
 ---
 
@@ -28,168 +26,234 @@ SSD1306 OLED (128x64 I2C)
 
 ```
 BadCodecPlayer/
-├── platformio.ini          PlatformIO 設定
-├── sdkconfig.defaults      ESP-IDF 設定
+├── platformio.ini          PlatformIO / ESP-IDF 設定
+├── sdkconfig.defaults      ESP-IDF カーネル設定
 ├── README.md               このファイル
 ├── include/
-│   ├── bad_player_config.h ★ ハードウェア設定 (GPIO等はここで変更)
-│   ├── bad_decode.h        BadCodec デコーダ ヘッダ
-│   ├── ssd1306.h           SSD1306 ドライバ ヘッダ
-│   └── bad_data.h          ★ 動画データ (要生成・差し替え)
+│   ├── config.h            ★ GPIO / FPS / 解像度の一元管理
+│   ├── bad_decode.h        BadCodec v0.6.0 デコーダ ヘッダ
+│   ├── ssd1306_drv.h       SSD1306 ドライバ ヘッダ
+│   └── bad_data.h          ★ 動画データ (→ 手順3 で差し替える)
 └── src/
-    ├── main.c              メインアプリ
-    ├── ssd1306.c           SSD1306 ドライバ実装
+    ├── main.c              再生ロジック・app_main
+    ├── ssd1306_drv.c       I2C + framebuffer + gram 変換
     └── bad_decode.cpp      BadCodec デコーダ実装
 ```
 
 ---
 
-## クイックスタート
+## 事前準備
 
-### 1. 動画フレームを用意する
-
-72x40 px の白黒 BMP 連番ファイルを用意する。
+### 必要なツール
 
 ```bash
-# ffmpeg で mp4 → 72x40 白黒 BMP 連番に変換する例
-ffmpeg -i input.mp4 \
-       -vf "scale=72:40,format=gray,binarize=thresh=128" \
-       -pix_fmt monob \
-       frames/frame_%04d.bmp
+# Python パッケージ
+pip install Pillow numpy
+
+# PlatformIO (VS Code 拡張または CLI)
+pip install platformio
 ```
+
+---
+
+## 手順
+
+### 1. 動画フレームを BMP に変換する
+
+72x40 白黒 BMP の連番ファイルを用意する。
+
+```bash
+# ffmpeg の例: mp4 → 72x40 白黒 BMP 連番
+ffmpeg -i input.mp4 \
+    -vf "scale=72:40:force_original_aspect_ratio=decrease,\
+         pad=72:40:(ow-iw)/2:(oh-ih)/2,\
+         format=gray" \
+    -pix_fmt monob \
+    frames/frame_%04d.bmp
+
+# フレーム数を確認
+ls frames/ | wc -l
+```
+
+> **解像度は必ず 72x40 にすること。**  
+> 8 の倍数でなければならない (72 = 9×8 / 40 = 5×8 ✓)
+
+---
 
 ### 2. BadCodec でエンコードする
 
 ```bash
-# エンコード (72x40 で必ずエンコードすること)
-python3 tools/Codec.py -t e \
+# Codec.py のある場所に移動
+cd /path/to/BadCodec/tools
+
+# エンコード
+python3 Codec.py -t e \
     -p ./frames \
     -n frame_ \
     -s 0001 \
     -e 6572 \
     -o output.bad
 
-# 結果例:
+# 実行例の出力:
+# BadCodec v0.6.0 Encoder  [8 cores]  Phase 1/2: Encoding
+# ...
 # Done. Saved to output.bad (972,249 bytes, 14.45% of raw  6.922x)
+#   Frame FOR merge: 972,398B → 972,230B  (saved 168B)
 ```
+
+**オプション説明:**
+
+| オプション | 説明 |
+|-----------|------|
+| `-p` | BMP フレームのディレクトリ |
+| `-n` | ファイル名プレフィックス (例: `frame_` → `frame_0001.bmp`) |
+| `-s` | 開始フレーム番号 |
+| `-e` | 終了フレーム番号 |
+| `-o` | 出力 .bad ファイル名 |
+
+---
 
 ### 3. C ヘッダファイルを生成する
 
 ```bash
-# C ヘッダ生成 (-H オプションでファイル名を指定)
-python3 tools/Codec.py -t c \
+python3 Codec.py -t c \
     -i output.bad \
     -H bad_data.h
-
-# 生成されるファイル内容:
-#   #define BAD_DATA_WIDTH   72U
-#   #define BAD_DATA_HEIGHT  40U
-#   #define BAD_DATA_FRAMES  6572U
-#   const uint8_t bad_data[] = { 0x13, 0x00, ... };
 ```
 
-### 4. ヘッダファイルをプロジェクトに配置する
+**生成されるファイルの内容:**
+
+```c
+#define BAD_DATA_WIDTH    72U
+#define BAD_DATA_HEIGHT   40U
+#define BAD_DATA_FRAMES   6572U
+#define BAD_DATA_SIZE     972249UL
+
+#ifdef __AVR__
+const uint8_t bad_data[] PROGMEM = {
+#else
+const uint8_t bad_data[] = {
+#endif
+    0x13, 0x00, 0xXX, ...
+};
+```
+
+---
+
+### 4. ヘッダをプロジェクトに配置する
 
 ```bash
-cp bad_data.h BadCodecPlayer/include/bad_data.h
+cp bad_data.h /path/to/BadCodecPlayer/include/bad_data.h
 ```
+
+---
 
 ### 5. ビルドして書き込む
 
 ```bash
 cd BadCodecPlayer
+
+# ビルド + 書き込み
 pio run --target upload
 
-# シリアルモニタで確認
+# シリアルモニタ (動作確認)
 pio device monitor
+```
+
+**正常時の出力:**
+
+```
+I (xxx) BadCodec: BadCodecPlayer v0.6.0  Protocol 514
+I (xxx) BadCodec: Board: ESP32-C3 Super Mini  OLED: 72x40 builtin
+I (xxx) BadCodec: Source: Flash
+I (xxx) BadCodec: OK  72x40  6572 frames  ~34fps
 ```
 
 ---
 
-## 設定変更
+## Flash 容量
 
-`include/bad_player_config.h` を編集する。
+```
+ESP32-C3 Mini Flash: 4MB
+  ファームウェア本体: ~200KB
+  bad_data (972KB 動画): ~972KB
+  合計: ~1.2MB → 4MB に余裕で収まる ✓
 
-```c
-/* GPIO */
-#define BAD_I2C_SDA    5    /* 変更可 */
-#define BAD_I2C_SCL    6    /* 変更可 */
-
-/* 動画解像度 (エンコード時と一致させること) */
-#define BAD_VIDEO_WIDTH   72
-#define BAD_VIDEO_HEIGHT  40
-
-/* フレームレート */
-#define BAD_FRAME_MS   29   /* 約34fps。元動画のFPSに合わせて調整 */
-
-/* 読み込み元 */
-#define BAD_SOURCE_FLASH 1   /* Flash から読む (デフォルト) */
-/* #define BAD_SOURCE_SD 1 */ /* SD カードから読む場合はこちらを有効化 */
+動画が 3MB を超える場合は SD カードを使用すること。
 ```
 
 ---
 
 ## SD カードから再生する場合
 
-`bad_player_config.h` で `BAD_SOURCE_SD` を有効化する。
+### 1. config.h を編集する
 
 ```c
-/* #define BAD_SOURCE_FLASH 1 */  /* ← コメントアウト */
-#define BAD_SOURCE_SD    1         /* ← 有効化 */
+/* include/config.h */
+/* #define CFG_SOURCE_FLASH  1 */   /* ← コメントアウト */
+#define CFG_SOURCE_SD     1          /* ← 有効化 */
 ```
 
-SD カードのルートに `output.bad` を置く。
+### 2. SD カードに動画を置く
 
 ```
-SD カード
+SD カード (FAT32)
 └── output.bad
 ```
 
----
+### 3. SD 接続ピン (デフォルト)
 
-## Flash 容量の目安
-
-```
-ESP32-C3 Mini フラッシュ: 4MB
-アプリ本体 (ファームウェア): 約 200KB
-bad_data.h (972KB 動画):    約 972KB
-合計:                       約 1.2MB → 4MB に収まる ✓
-
-より大きな動画の場合は SD カード再生を使用すること。
-```
+SD モジュールを別途接続する必要があります。  
+`config.h` の `CFG_SD_*` を使用する SD モジュールのピンに合わせて変更してください。
 
 ---
 
-## 動画サイズと OLED の関係
+## フレームレート調整
+
+`include/config.h` を編集する:
+
+```c
+#define CFG_FRAME_MS  29   /* 約 34fps */
+/* #define CFG_FRAME_MS  33 */  /* 約 30fps */
+/* #define CFG_FRAME_MS  41 */  /* 約 24fps */
+```
+
+元動画の FPS に合わせて調整すること。
+
+---
+
+## 画面上のピクセル配置
 
 ```
-SSD1306 物理解像度: 128 x 64 px
-BadCodec 動画域:     72 x 40 px
+SSD1306 物理パネル 128x64:
 
-配置:
-  ┌────────────────────────────────┐ 128px
-  │           (余白 12px)          │
-  │   ┌──────────────────────┐    │
-  │   │                      │    │ ← 72x40 動画
-  │   │     動画表示域        │    │
-  │   └──────────────────────┘    │
-  │           (余白 12px)          │
-  └────────────────────────────────┘
+┌────────────────────────────────────────┐  y=0
+│                                        │
+│                                        │  y=11 (CFG_Y_OFFSET=12 の直前)
+│   ┌──────────────────────────────┐    │  y=12  ← 動画 y=0
+│   │                              │    │
+│   │    Bad Apple!! 72x40 動画    │    │
+│   │                              │    │
+│   └──────────────────────────────┘    │  y=51  ← 動画 y=39
+│                                        │
+└────────────────────────────────────────┘  y=63
+x=0                              x=27+72=99    x=127
 
-xOffset = 27  (画面左右余白)
-yOffset = 12  (画面上下余白)
+CFG_X_OFFSET = 27  (左右余白)
+CFG_Y_OFFSET = 12  (上下余白)
 ```
 
 ---
 
 ## トラブルシューティング
 
-| 症状 | 原因 | 対処 |
-|------|------|------|
-| 画面が全点灯して点滅 | bad_init 失敗 | bad_data.h の内容を確認 |
-| 画像がずれる | オフセット設定ミス | BAD_X_OFFSET / BAD_Y_OFFSET を調整 |
-| コマ落ちする | フレームレートが速い | BAD_FRAME_MS を大きくする |
-| フラッシュ容量不足 | 動画が大きすぎる | SD カードを使用する |
+| 症状 | 確認事項 |
+|------|---------|
+| 画面が映らない | GPIO5/6 の I2C 接続。`pio device monitor` でログ確認 |
+| 全点灯点滅 | `bad_init` 失敗。`bad_data.h` のヘッダを確認 |
+| 映像が画面端にずれる | `CFG_X_OFFSET` / `CFG_Y_OFFSET` を調整 |
+| コマ落ち | `CFG_FRAME_MS` を大きくする |
+| Flash 容量不足 | `CFG_SOURCE_SD` に切り替える |
 
 ---
 
