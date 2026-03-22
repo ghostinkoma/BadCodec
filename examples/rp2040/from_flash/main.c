@@ -1,6 +1,7 @@
 /**
  * @file  main.c
  * @brief BadCodec サンプル: RP2040 / RP2350 / ヘッダファイル (bad_data.h) から再生
+ * @version v0.6.0  (Protocol 514, SPEC rev.19)
  *
  * ビルド方法 (Pico SDK 2.x):
  *   mkdir build && cd build
