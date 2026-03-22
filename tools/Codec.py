@@ -294,7 +294,8 @@ def _try_rle(block):
     return best
 
 def _encode_master_block(block):
-    raw = np.packbits(block.flatten())
+    # bitorder='little': LSB first (bit0=左端col0) ← Cデコーダと一致
+    raw = np.packbits(block.flatten(), bitorder='little')
     return bytes([OP_MASTER_BLOCK_B]) + bytes(raw)  # 9 bytes total
 
 # ============================================================
@@ -730,7 +731,8 @@ def decode_frame(data, prev_f, w, h):
     if op == OP_INVERT_PREV:
         return (1 - prev_f).astype(np.uint8)
     if op == OP_MASTER_FRAME:
-        bits = np.unpackbits(np.frombuffer(data[1:], dtype=np.uint8))[:w * h]
+        bits = np.unpackbits(np.frombuffer(data[1:], dtype=np.uint8),
+                             bitorder='little')[:w * h]
         return bits.reshape(h, w).astype(np.uint8)
     # RLE_FRAME: 0x30-0x37 (8走査パターン)
     if 0x30 <= op <= 0x37:
@@ -870,7 +872,8 @@ def _decode_block_stream(stream, prev_f, w, h, bx, n_blk):
 
         # MASTER_BLOCK
         if cmd == OP_MASTER_BLOCK_B:
-            bits = np.unpackbits(np.frombuffer(stream[p:p+8], dtype=np.uint8))
+            bits = np.unpackbits(np.frombuffer(stream[p:p+8], dtype=np.uint8),
+                                 bitorder='little')
             curr_f[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = \
                 bits.reshape(BLOCK_SIZE, BLOCK_SIZE)
             return b_i + 1, p + 8
@@ -1033,7 +1036,7 @@ def _self_verify(frame_idx, data, types, original, prev_f, w, h):
         err = str(e)
 
     # Fallback: MASTER_FRAME
-    fb_data = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(original.flatten()))
+    fb_data = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(original.flatten(), bitorder='little'))
     n_blk   = (w // BLOCK_SIZE) * (h // BLOCK_SIZE)
     try:
         decoded2 = decode_frame(fb_data, prev_f, w, h)
@@ -1091,7 +1094,7 @@ def encode_frame_worker(args):
     # ----------------------------------------------------------
 
     # 候補C: MASTER_FRAME (固定長 raw_sz+1 B)
-    cand_c = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(curr_f.flatten()))
+    cand_c = bytes([OP_MASTER_FRAME]) + bytes(np.packbits(curr_f.flatten(), bitorder='little'))
     candidates.append((cand_c, ['M'] * n_blk))
     master_sz = len(cand_c)   # = raw_sz + 1
 
