@@ -1,6 +1,7 @@
 /**
  * @file  main.c
  * @brief BadCodec サンプル: RP2040 / RP2350 / SD カードから再生
+ * @version v0.6.0  (Protocol 514, SPEC rev.19)
  *
  * SD カード: SPI 接続 (no_os_fatfs または FatFs ライブラリ)
  * ディスプレイ: SSD1306 128x64
