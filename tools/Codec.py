@@ -262,35 +262,39 @@ def apply_shift(block, sx, sy):
 # Block encoder  (仕様書 9-1節)
 # ============================================================
 def _try_rle(block):
-    """Try all 8 scan patterns × 2 start colors. Return (opcode, 3bytes) or None."""
+    """Try all 8 scan patterns. start_color is always the first pixel color.
+    This guarantees runs[0] >= 1, which is required by the C decoder.
+    Return (opcode, 3bytes) or None."""
     best = None
     for p_idx in range(8):
-        path   = SCAN_PATHS[p_idx]
-        pixels = block[path[:, 1], path[:, 0]]
-        for start_col in range(2):
-            runs  = []
-            curr  = start_col
-            count = 0
-            valid = True
-            for px in pixels:
-                if int(px) == curr:
-                    count += 1
-                else:
-                    if count > 63:
-                        valid = False; break
-                    runs.append(count)
-                    curr  = 1 - curr
-                    count = 1
-            if not valid:
-                continue
-            if count > 63:
-                continue
-            runs.append(count)
-            if len(runs) > 4:
-                continue
-            opcode = 0x20 | (p_idx << 1) | start_col
-            if best is None:
-                best = (opcode, pack_rle(runs))
+        path      = SCAN_PATHS[p_idx]
+        pixels    = block[path[:, 1], path[:, 0]]
+        # start_color は常に先頭ピクセルの色に合わせる
+        # → runs[0]=0 の生成を根絶する
+        start_col = int(pixels[0])
+        runs  = []
+        curr  = start_col
+        count = 0
+        valid = True
+        for px in pixels:
+            if int(px) == curr:
+                count += 1
+            else:
+                if count > 63:
+                    valid = False; break
+                runs.append(count)
+                curr  = 1 - curr
+                count = 1
+        if not valid:
+            continue
+        if count > 63:
+            continue
+        runs.append(count)
+        if len(runs) > 4:
+            continue
+        opcode = 0x20 | (p_idx << 1) | start_col
+        if best is None:
+            best = (opcode, pack_rle(runs))
     return best
 
 def _encode_master_block(block):
