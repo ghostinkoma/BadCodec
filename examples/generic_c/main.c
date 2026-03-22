@@ -123,7 +123,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("BadCodec v0.5.5 / Protocol %d\n", BAD_PROTOCOL_VERSION);
+    printf("BadCodec v0.6.0 / Protocol %d\n", BAD_PROTOCOL_VERSION);
     printf("Image: %ux%u  Frames: %u\n",
            ctx.width, ctx.height, ctx.total_frames);
 
