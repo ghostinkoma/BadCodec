@@ -118,9 +118,19 @@ static void apply_rle_runs(bad_ctx_t *ctx,
     int8_t  dx       = (p_idx & 1U) ? -1 : 1;
     int8_t  dy       = (p_idx & 2U) ? -1 : 1;
 
-    uint8_t color   = start_color;
-    uint8_t ri      = 0U;
-    uint8_t remain  = (n_runs > 0U) ? runs[0] : 0U;
+    uint8_t color  = start_color;
+    uint8_t ri     = 0U;
+    uint8_t remain = (n_runs > 0U) ? runs[0] : 0U;
+
+    /* runs[0]=0 の防御処理:
+     * remain=0 はこの色を 0個書く = 即座に次の色へ進む。
+     * エンコーダは先頭ピクセルの色に合わせた start_color を出力するため
+     * 通常 runs[0] >= 1 が保証される。ただし防御的に処理する。 */
+    while (remain == 0U && ri + 1U < n_runs) {
+        color ^= 1U;
+        ri++;
+        remain = runs[ri];
+    }
 
     uint8_t outer;
     for (outer = 0U; outer < BAD_BLOCK_SIZE; outer++) {
@@ -136,7 +146,7 @@ static void apply_rle_runs(bad_ctx_t *ctx,
             }
             gp_set(ctx->gram, blk_bit(ctx, bx, by, px, py), color);
 
-            if (remain > 0U) remain--;
+            remain--;
             if (remain == 0U) {
                 color ^= 1U;
                 ri++;
@@ -370,8 +380,10 @@ static bad_result_t decode_block_stream(bad_ctx_t *ctx)
             uint8_t iop    = bad_read1(ctx);
             uint8_t fi;
             for (fi = 0U; fi < repeat && ptr < total; fi++) {
-                uint8_t bx = (uint8_t)(ptr % nbx);
-                uint8_t by = (uint8_t)(ptr / nbx);
+                /* bx/by はループ先頭ではなく各命令直前で計算する。
+                 * SKIP/INVERT/FILL は内部の while で ptr を進めるため
+                 * ループ先頭の bx/by は使わない。
+                 * SHIFT は ptr を1つ進めるだけなので直前の ptr から計算。 */
                 if (BAD_IS_SKIP(iop)) {
                     uint8_t cnt = (uint8_t)BAD_SKIP_COUNT(iop);
                     while (cnt-- && ptr < total) {
@@ -392,7 +404,10 @@ static bad_result_t decode_block_stream(bad_ctx_t *ctx)
                         ptr++;
                     }
                 } else if (BAD_IS_SHIFT(iop)) {
-                    decode_shift_bit(ctx, bx, by, iop);
+                    /* SHIFT: ptr から bx/by を毎回計算する */
+                    uint8_t sbx = (uint8_t)(ptr % nbx);
+                    uint8_t sby = (uint8_t)(ptr / nbx);
+                    decode_shift_bit(ctx, sbx, sby, iop);
                     ptr++;
                 } else {
                     return BAD_ERR_DATA;
