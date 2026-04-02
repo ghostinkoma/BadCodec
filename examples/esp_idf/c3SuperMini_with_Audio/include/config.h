@@ -82,6 +82,7 @@
   *     3) VIDEO=1, AUDIO=1 → 両方同時（本来の動作）
   * ---------------------------------------------------------- */
  #define CFG_VIDEO_ENABLE    1   /* 1=ON  0=OFF */
+//Audio 実験的
  #define CFG_AUDIO_ENABLE    1   /* 1=ON  0=OFF */
 
  #endif /* CONFIG_H */
