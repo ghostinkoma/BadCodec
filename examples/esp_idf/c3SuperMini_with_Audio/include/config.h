@@ -11,7 +11,7 @@
  #define CFG_I2C_PORT        I2C_NUM_0
  #define CFG_I2C_SDA         8
  #define CFG_I2C_SCL         9
- #define CFG_I2C_FREQ_HZ     1000000
+ #define CFG_I2C_FREQ_HZ     400000
  
  /* ---- SSD1306 128x64 -------------------------------------- */
  #define CFG_OLED_ADDR       0x3D
@@ -27,20 +27,40 @@
  #define CFG_VIDEO_W         128
  #define CFG_VIDEO_H         64
  
- /* ---- Audio: differential sigma-delta PDM output ----------
-  * Two GPIO pins required for balanced (differential) output.
-  *   CFG_AUDIO_PIN_P : positive (non-inverting) Sigma-Delta bit
-  *   CFG_AUDIO_PIN_N : negative (inverting)     Sigma-Delta bit
-  * Connect each through 100ohm + 10nF RC to a differential
-  * amplifier (e.g. PAM8302 in BTL mode) or balanced speaker.
-  * Avoid GPIO11-17 (internal flash).
-  * GPIO8/9 with NO external pull-ups: OK (used for I2C above). */
- #define CFG_AUDIO_PIN_P     10      /* positive phase GPIO */
- #define CFG_AUDIO_PIN_N     3       /* negative phase GPIO */
+ /* ---- Audio: sigma-delta PDM output -----------------------
+  *
+  * CFG_AUDIO_DIFFERENTIAL  1 = 差動出力 (PIN_P + PIN_N 両方使用)
+  *                          0 = シングルエンド出力 (PIN_P のみ)
+  *
+  * ノイズ切り分け用:
+  *   差動出力では ISR 内で 2回の REG_WRITE が必要。
+  *   2回の書き込みの間 (~3ns) に両ピンが同レベルになるグリッチが
+  *   160kHz で発生し LPF 後のノイズ源になる可能性がある。
+  *   また GPIO3 (PIN_N) は ESP32-C3 の UART0_RX と共用されることがあり
+  *   USB シリアル通信と干渉する可能性がある。
+  *
+  *   まず CFG_AUDIO_DIFFERENTIAL=0 で切り分けることを推奨。
+  *
+  * シングルエンド接続 (CFG_AUDIO_DIFFERENTIAL=0):
+  *   GPIO10 → R=1kΩ → ┬─ C=10nF  → GND       (LPF fc≈16kHz)
+  *                     └─ C=10μF  → アンプ入力 (カップリング)
+  *
+  * 差動接続 (CFG_AUDIO_DIFFERENTIAL=1):
+  *   GPIO10 → R=100Ω → 差動アンプ +入力
+  *   GPIO3  → R=100Ω → 差動アンプ −入力
+  *   → 電源ノイズをCMRRでキャンセルできる (理論上)
+  *   → ただし2ピン間のスキューがノイズ源になることもある
+  *
+  * CFG_AUDIO_PIN_P : 正相 GPIO (シングルエンド時もこちらを使用)
+  * CFG_AUDIO_PIN_N : 逆相 GPIO (差動時のみ使用, 0=sigle では固定LOW)
+  * ---------------------------------------------------------- */
+ #define CFG_AUDIO_DIFFERENTIAL  1       /* 0=シングルエンド(推奨)  1=差動 */
+ #define CFG_AUDIO_PIN_P         10      /* positive phase GPIO */
+ #define CFG_AUDIO_PIN_N         3       /* negative phase GPIO (差動時のみ) */
  
  /* Audio sampling rate — adpcm4.h WAVヘッダ実測値: 16000Hz
   * ffmpeg: ffmpeg -i input.mp4 -ac 1 -ar 16000 -c:a adpcm_ima_wav out.wav */
- #define CFG_AUDIO_SR        173000U
+ #define CFG_AUDIO_SR        16000U
 
  /* ΣΔ変調オーバーサンプリング比は adpcm_drv.c の SDM_OSR マクロで設定。
   * デフォルト: SDM_OSR=32 → ISR @ 512kHz → 音質向上 (低音再現)
@@ -53,7 +73,7 @@
   * Nominal frame interval in milliseconds (~34.5 fps).
   * When audio is running the frame rate is derived from the
   * audio sample clock; CFG_FRAME_MS is a fallback only.       */
- #define CFG_FRAME_MS        32U
+ #define CFG_FRAME_MS        29U
  
  /* ---- Audio/Video sync (参考値) ---------------------------
   * 実際の計算は adpcm_drv.c の ISR 内で s_sample_rate から行う。
@@ -82,7 +102,6 @@
   *     3) VIDEO=1, AUDIO=1 → 両方同時（本来の動作）
   * ---------------------------------------------------------- */
  #define CFG_VIDEO_ENABLE    1   /* 1=ON  0=OFF */
-//Audio 実験的
  #define CFG_AUDIO_ENABLE    1   /* 1=ON  0=OFF */
 
  #endif /* CONFIG_H */
