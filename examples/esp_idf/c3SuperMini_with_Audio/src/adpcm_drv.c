@@ -138,7 +138,12 @@ static gptimer_handle_t  s_gptimer;
 /* ISR 同期カウンタ */
 static volatile uint32_t s_isr_osr_cnt;   /* OSRカウンタ (0〜SDM_OSR-1) */
 static volatile int16_t  s_cur_sample;    /* 現在のPCMサンプル */
-static volatile int32_t  s_sd_accum;      /* ΣΔアキュムレータ */
+/* 2次ΣΔ変調アキュムレータ
+ *   e1: 1段目積分器 (入力 - フィードバック)
+ *   e2: 2段目積分器 (e1   - フィードバック)
+ *   量子化ノイズを高周波に押し込み可聴域の SNR を大幅改善する */
+static volatile int32_t  s_sd_e1;         /* 1段目アキュムレータ */
+static volatile int32_t  s_sd_e2;         /* 2段目アキュムレータ */
 static volatile uint32_t s_isr_samples;   /* 消費サンプル数 */
 static volatile uint32_t s_frames_given;
 
@@ -264,13 +269,19 @@ static void decode_block_to_ring(const uint8_t *blk, uint32_t bytes)
 /* ============================================================
  * gptimer ISR — 160kHz (= s_sample_rate × SDM_OSR) で発火
  *
- * 毎 ISR: 1回ΣΔ演算 → GPIO を1回切り替え。
- * OSRカウンタが SDM_OSR(10) に達したら ring から次サンプルを取得。
+ * 2次ソフトウェアΣΔ変調 (ノイズシェーピング強化版)
  *
- * ΣΔ変調 (1次):
- *   accumulator += current_sample
- *   if (accum >= 0): P=HIGH N=LOW, accum -= 32767
- *   else:            P=LOW  N=HIGH, accum += 32767
+ * 1次ΣΔ (OSR=10): SNR ≈ 21 dB → 不十分
+ * 2次ΣΔ (OSR=10): SNR ≈ 43 dB → 実用的な音楽品質
+ *
+ * アルゴリズム:
+ *   fb  = out_prev ? +32767 : -32767  (1bit フィードバック)
+ *   e1 += sample - fb                 (1段目積分)
+ *   e2 += e1     - fb                 (2段目積分)
+ *   out = (e2 >= 0)                   (量子化)
+ *   GPIO_P = out
+ *
+ * OSRカウンタが SDM_OSR(10) に達したら ring から次サンプルを取得。
  * ============================================================ */
 static IRAM_ATTR bool sd_isr_cb(gptimer_handle_t timer,
                                  const gptimer_alarm_event_data_t *edata,
@@ -289,7 +300,7 @@ static IRAM_ATTR bool sd_isr_cb(gptimer_handle_t timer,
         } else {
             s_cur_sample = 0;   /* アンダーラン → 無音 */
         }
-        /* フレーム同期: 消費サンプル数でセマフォ give */
+        /* フレーム同期 */
         s_isr_samples++;
         uint32_t spf = (s_sample_rate * (uint32_t)CFG_FRAME_MS) / 1000U;
         if (spf > 0U) {
@@ -301,17 +312,54 @@ static IRAM_ATTR bool sd_isr_cb(gptimer_handle_t timer,
         }
     }
 
-    /* 1次ΣΔ変調 → GPIO を1bit 出力 (1 ISR = 1 PDM bit) */
-    s_sd_accum += (int32_t)s_cur_sample;
-    if (s_sd_accum >= 0) {
+    /* 2次ΣΔ変調 → GPIO を1bit 出力
+     *
+     * fb = 現在の出力に対するフィードバック値
+     *      出力 HIGH (+1) → fb = +32767
+     *      出力 LOW  (-1) → fb = -32767
+     *
+     * e1 += sample - fb   (1段目: 入力 - フィードバック を積分)
+     * e2 += e1 - fb        (2段目: e1  - フィードバック を積分)
+     * out = (e2 >= 0)      (量子化)
+     *
+     * 2段階の積分により量子化ノイズのスペクトルが高周波側に
+     * より急峻にシフトされ、可聴域 (0〜16kHz/2=8kHz) の SNR が向上する。
+     */
+    int32_t sample = (int32_t)s_cur_sample;
+    int32_t e1     = s_sd_e1;
+    int32_t e2     = s_sd_e2;
+
+    /* 前回の出力に基づくフィードバック */
+    int32_t fb = (e2 >= 0) ? 32767 : -32767;
+
+    e1 += sample - fb;
+    e2 += e1     - fb;
+
+    /* オーバーフロー抑制: 積分器が発散しないようにクランプ */
+    if      (e1 >  0x400000) { e1 =  0x400000; }
+    else if (e1 < -0x400000) { e1 = -0x400000; }
+    if      (e2 >  0x400000) { e2 =  0x400000; }
+    else if (e2 < -0x400000) { e2 = -0x400000; }
+
+    s_sd_e1 = e1;
+    s_sd_e2 = e2;
+
+    /* GPIO 出力 */
+#if (CFG_AUDIO_DIFFERENTIAL == 1)
+    if (e2 >= 0) {
         REG_WRITE(GPIO_OUT_W1TS_REG, s_mask_p);
         REG_WRITE(GPIO_OUT_W1TC_REG, s_mask_n);
-        s_sd_accum -= 32767;
     } else {
         REG_WRITE(GPIO_OUT_W1TC_REG, s_mask_p);
         REG_WRITE(GPIO_OUT_W1TS_REG, s_mask_n);
-        s_sd_accum += 32767;
     }
+#else
+    if (e2 >= 0) {
+        REG_WRITE(GPIO_OUT_W1TS_REG, s_mask_p);
+    } else {
+        REG_WRITE(GPIO_OUT_W1TC_REG, s_mask_p);
+    }
+#endif
 
     return (woken == pdTRUE);
 }
@@ -358,7 +406,8 @@ int adpcm_init(const uint8_t    *adpcm_data,
     s_ring_rd      = 0U;
     s_isr_osr_cnt  = 0U;
     s_cur_sample   = 0;
-    s_sd_accum     = 0;
+    s_sd_e1        = 0;
+    s_sd_e2        = 0;
     s_isr_samples  = 0U;
     s_frames_given = 0U;
 
@@ -375,6 +424,8 @@ int adpcm_init(const uint8_t    *adpcm_data,
 
     gpio_config_t gc;
     memset(&gc, 0, sizeof(gc));
+#if (CFG_AUDIO_DIFFERENTIAL == 1)
+    /* 差動: PIN_P + PIN_N 両方を OUTPUT に設定 */
     gc.pin_bit_mask = ((uint64_t)1U << CFG_AUDIO_PIN_P)
                     | ((uint64_t)1U << CFG_AUDIO_PIN_N);
     gc.mode         = GPIO_MODE_OUTPUT;
@@ -384,7 +435,20 @@ int adpcm_init(const uint8_t    *adpcm_data,
     ESP_ERROR_CHECK(gpio_config(&gc));
     ESP_ERROR_CHECK(gpio_set_level(CFG_AUDIO_PIN_P, 0U));
     ESP_ERROR_CHECK(gpio_set_level(CFG_AUDIO_PIN_N, 1U));
-    ESP_LOGI(TAG, "GPIO P=%d  N=%d", CFG_AUDIO_PIN_P, CFG_AUDIO_PIN_N);
+    ESP_LOGI(TAG, "GPIO mode: DIFFERENTIAL  P=GPIO%d  N=GPIO%d",
+             CFG_AUDIO_PIN_P, CFG_AUDIO_PIN_N);
+#else
+    /* シングルエンド: PIN_P のみ OUTPUT。PIN_N は固定 LOW (使用しない) */
+    gc.pin_bit_mask = ((uint64_t)1U << CFG_AUDIO_PIN_P);
+    gc.mode         = GPIO_MODE_OUTPUT;
+    gc.pull_up_en   = GPIO_PULLUP_DISABLE;
+    gc.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gc.intr_type    = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&gc));
+    ESP_ERROR_CHECK(gpio_set_level(CFG_AUDIO_PIN_P, 0U));
+    ESP_LOGI(TAG, "GPIO mode: SINGLE-ENDED  P=GPIO%d  (N=GPIO%d unused)",
+             CFG_AUDIO_PIN_P, CFG_AUDIO_PIN_N);
+#endif
 
     /* gptimer: SR * OSR Hz で発火 */
     gptimer_config_t tcfg;
@@ -411,6 +475,62 @@ int adpcm_init(const uint8_t    *adpcm_data,
     cbs.on_alarm = sd_isr_cb;
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(s_gptimer, &cbs, NULL));
     ESP_ERROR_CHECK(gptimer_enable(s_gptimer));
+
+    /* ---- ring バッファの事前充填 --------------------------------
+     * gptimer (ISR) を開始する前に ring を満杯にしておく。
+     * これにより起動直後の ring underrun によるグリッチを防ぐ。
+     *
+     * RING_SIZE=131072 samples = 8.2秒分を事前充填する。
+     * adpcm_init() は app_main タスクコンテキスト (FreeRTOS スケジューラ動作中)
+     * で呼ばれるため vTaskDelay を使わず直接デコードループを回す。
+     * (スケジューラ開始前の場合は vTaskDelay が使えないが、
+     *  ここでは app_main 内 = スケジューラ起動後なので問題なし)
+     * ------------------------------------------------------------ */
+    ESP_LOGI(TAG, "pre-filling ring buffer (%u samples)...", ADPCM_RING_SIZE);
+    {
+        uint32_t filled = 0U;
+        while (filled < (ADPCM_RING_SIZE - 1U)) {
+            if (s_read_pos >= (s_data_offset + s_data_size)) {
+                break;  /* WAV データ終端 */
+            }
+            uint32_t remaining = (s_data_offset + s_data_size) - s_read_pos;
+            uint32_t blk = (s_block_align > 0U) ? s_block_align : 512U;
+            if (blk > remaining) { blk = remaining; }
+
+            /* ring が満杯になるまでデコード */
+            const uint8_t *p = s_wav_data + s_read_pos;
+
+            adpcm_state_t st;
+            st.predictor  = (int16_t)((uint16_t)p[0] | ((uint16_t)p[1]<<8));
+            st.step_index = (int8_t)p[2];
+            if (st.step_index <  0) { st.step_index =  0; }
+            if (st.step_index > 88) { st.step_index = 88; }
+
+            /* ヘッダサンプル */
+            if (!ring_full()) {
+                int16_t s = (int16_t)(((int32_t)st.predictor
+                                       * (int32_t)CFG_AUDIO_VOL) >> 8);
+                s_ring[s_ring_wr & (ADPCM_RING_SIZE - 1U)] = s;
+                s_ring_wr++;
+                filled++;
+            }
+            /* ニブルサンプル */
+            for (uint32_t i = 4U; i < blk && !ring_full(); i++) {
+                int16_t s0 = adpcm_nibble(&st, p[i] & 0x0FU);
+                int16_t s1 = adpcm_nibble(&st, (p[i] >> 4) & 0x0FU);
+                int16_t v0 = (int16_t)(((int32_t)s0 * (int32_t)CFG_AUDIO_VOL) >> 8);
+                int16_t v1 = (int16_t)(((int32_t)s1 * (int32_t)CFG_AUDIO_VOL) >> 8);
+                s_ring[s_ring_wr & (ADPCM_RING_SIZE - 1U)] = v0; s_ring_wr++; filled++;
+                if (ring_full()) break;
+                s_ring[s_ring_wr & (ADPCM_RING_SIZE - 1U)] = v1; s_ring_wr++; filled++;
+            }
+            s_read_pos += blk;
+        }
+        ESP_LOGI(TAG, "pre-fill done: %"PRIu32" samples (%.1f sec)",
+                 filled, (float)filled / (float)s_sample_rate);
+    }
+
+    /* gptimer 開始: ring が充填済みなので起動直後からノイズなし */
     ESP_ERROR_CHECK(gptimer_start(s_gptimer));
 
     xTaskCreatePinnedToCore(adpcm_task, "adpcm",
@@ -442,13 +562,18 @@ void adpcm_rewind(void)
     s_ring_rd      = 0U;
     s_isr_osr_cnt  = 0U;
     s_cur_sample   = 0;
-    s_sd_accum     = 0;
+    s_sd_e1        = 0;
+    s_sd_e2        = 0;
     s_isr_samples  = 0U;
     s_frames_given = 0U;
 
-    /* GPIO をアイドル状態 (P=LOW, N=HIGH) に戻す */
+    /* GPIO をアイドル状態に戻す */
+#if (CFG_AUDIO_DIFFERENTIAL == 1)
     REG_WRITE(GPIO_OUT_W1TC_REG, s_mask_p);
     REG_WRITE(GPIO_OUT_W1TS_REG, s_mask_n);
+#else
+    REG_WRITE(GPIO_OUT_W1TC_REG, s_mask_p);
+#endif
 
     gptimer_enable(s_gptimer);
     gptimer_start(s_gptimer);
