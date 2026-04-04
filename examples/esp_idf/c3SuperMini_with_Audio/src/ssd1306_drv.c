@@ -35,7 +35,7 @@
  #include "freertos/task.h"
  #include "esp_log.h"
  #include <string.h>
- 
+
  static const char *TAG = "SSD1306";
  
  uint8_t g_fb[CFG_PHYS_W * CFG_PAGES];
