@@ -1,7 +1,20 @@
 /**
  * @file  config.h
- * @brief ESP32-C3 Super Mini + SSD1306 128x64 + ADPCM audio
- * @version v0.8.1
+ * @brief ESP32-C3 Super Mini + SSD1306 128x64 + LEDC PWM audio
+ * @version v0.9.0
+ *
+ * v0.9.0 変更点:
+ *   音声出力方式を ソフトウェアΣΔ PDM → LEDC ハードウェア PWM に刷新。
+ *   CFG_AUDIO_DIFFERENTIAL 廃止。
+ *   LPF 定数を PWM キャリア (39kHz) 除去用に変更。
+ *
+ * LPF 必須変更:
+ *   旧 (ΣΔ用): R=1kΩ,  C=10nF  (fc≈16kHz) ← PWM では不十分
+ *   新 (PWM用): R=10kΩ, C=100nF (fc≈160Hz) ← キャリアを -48dB 減衰
+ *
+ * 接続:
+ *   GPIO10 → R=10kΩ → ┬── C=100nF ── GND  (LPF)
+ *                      └── C=10μF  ── アンプ入力 (カップリング)
  */
 
  #ifndef CONFIG_H
@@ -27,59 +40,37 @@
  #define CFG_VIDEO_W         128
  #define CFG_VIDEO_H         64
  
- /* ---- Audio: sigma-delta PDM output -----------------------
+ /* ---- Audio: LEDC PWM output ------------------------------
   *
-  * CFG_AUDIO_DIFFERENTIAL  1 = 差動出力 (PIN_P + PIN_N 両方使用)
-  *                          0 = シングルエンド出力 (PIN_P のみ)
+  * v2.0.0: ソフトウェアΣΔを廃止し LEDC ハードウェア PWM を使用。
   *
-  * ノイズ切り分け用:
-  *   差動出力では ISR 内で 2回の REG_WRITE が必要。
-  *   2回の書き込みの間 (~3ns) に両ピンが同レベルになるグリッチが
-  *   160kHz で発生し LPF 後のノイズ源になる可能性がある。
-  *   また GPIO3 (PIN_N) は ESP32-C3 の UART0_RX と共用されることがあり
-  *   USB シリアル通信と干渉する可能性がある。
+  * PWM キャリア: 39,062 Hz (80MHz / 2^11)  ← 可聴域 (20kHz) を超える
+  * PWM 分解能:   11 bit (0〜2047 = 2048段階)
+  * ダイナミックレンジ: 20×log10(2048) ≈ 66 dB
   *
-  *   まず CFG_AUDIO_DIFFERENTIAL=0 で切り分けることを推奨。
+  * CFG_AUDIO_PIN_P: PWM 出力 GPIO (LEDC CHANNEL_0)
   *
-  * シングルエンド接続 (CFG_AUDIO_DIFFERENTIAL=0):
-  *   GPIO10 → R=1kΩ → ┬─ C=10nF  → GND       (LPF fc≈16kHz)
-  *                     └─ C=10μF  → アンプ入力 (カップリング)
+  * 接続 (必須):
+  *   GPIO10 → R=10kΩ → ┬── C=100nF ── GND   (LPF fc≈160Hz)
+  *                      └── C=10μF  ── アンプ入力 (カップリング)
   *
-  * 差動接続 (CFG_AUDIO_DIFFERENTIAL=1):
-  *   GPIO10 → R=100Ω → 差動アンプ +入力
-  *   GPIO3  → R=100Ω → 差動アンプ −入力
-  *   → 電源ノイズをCMRRでキャンセルできる (理論上)
-  *   → ただし2ピン間のスキューがノイズ源になることもある
+  *   ※ ΣΔ時代の R=1kΩ, C=10nF では fc=16kHz でキャリアが通過する。
+  *     R=10kΩ, C=100nF (fc=160Hz) に必ず変更すること。
   *
-  * CFG_AUDIO_PIN_P : 正相 GPIO (シングルエンド時もこちらを使用)
-  * CFG_AUDIO_PIN_N : 逆相 GPIO (差動時のみ使用, 0=sigle では固定LOW)
+  * CFG_AUDIO_DIFFERENTIAL は廃止。差動出力は不要。
   * ---------------------------------------------------------- */
- #define CFG_AUDIO_DIFFERENTIAL  1       /* 0=シングルエンド(推奨)  1=差動 */
- #define CFG_AUDIO_PIN_P         10      /* positive phase GPIO */
- #define CFG_AUDIO_PIN_N         3       /* negative phase GPIO (差動時のみ) */
+ #define CFG_AUDIO_PIN_P     10      /* PWM 出力 GPIO */
  
- /* Audio sampling rate — adpcm4.h WAVヘッダ実測値: 16000Hz
-  * ffmpeg: ffmpeg -i input.mp4 -ac 1 -ar 16000 -c:a adpcm_ima_wav out.wav */
+ /* Audio sampling rate */
  #define CFG_AUDIO_SR        16000U
-
- /* ΣΔ変調オーバーサンプリング比は adpcm_drv.c の SDM_OSR マクロで設定。
-  * デフォルト: SDM_OSR=32 → ISR @ 512kHz → 音質向上 (低音再現)
-  * LPF推奨値: R=1kΩ, C=10nF (fc≈16kHz), カップリングC=10μF (アンプ経由) */
-
- /* Volume: 0 = mute, 256 = full scale (may clip) */
- #define CFG_AUDIO_VOL       200U
  
- /* ---- Frame timing ----------------------------------------
-  * Nominal frame interval in milliseconds (~34.5 fps).
-  * When audio is running the frame rate is derived from the
-  * audio sample clock; CFG_FRAME_MS is a fallback only.       */
+ /* Volume: 0=mute, 256=full scale */
+ #define CFG_AUDIO_VOL       120U
+ 
+ /* ---- Frame timing ---------------------------------------- */
  #define CFG_FRAME_MS        29U
  
- /* ---- Audio/Video sync (参考値) ---------------------------
-  * 実際の計算は adpcm_drv.c の ISR 内で s_sample_rate から行う。
-  * WAVヘッダのSRが config.h と異なっても自動的に正しく動作する。
-  *   例: SR=16000, frame_ms=29 → 16000*29/1000 = 464 samples/frame
-  * ---------------------------------------------------------- */
+ /* ---- A/V 同期 (参考値) ----------------------------------- */
  #define ADPCM_SAMPLES_PER_FRAME \
      ( (CFG_AUDIO_SR) * (CFG_FRAME_MS) / 1000U )
  
@@ -90,19 +81,10 @@
  #define CFG_SD_FILE         "/sdcard/output.bad"
  #define CFG_AUDIO_SD_FILE   "/sdcard/adpcm4.wav"
  #endif
-
- /* ---- Debug: Video / Audio enable -------------------------
-  *
-  *   CFG_VIDEO_ENABLE   1 = 映像再生あり  / 0 = 映像スキップ（OLEDは初期化のみ）
-  *   CFG_AUDIO_ENABLE   1 = 音声再生あり  / 0 = 音声なし（セマフォはソフトタイマで代替）
-  *
-  *   切り分け手順:
-  *     1) VIDEO=1, AUDIO=0 → 映像のみ再生できるか確認
-  *     2) VIDEO=0, AUDIO=1 → 音声のみ（シリアルログで ADPCM_SAMPLES 確認）
-  *     3) VIDEO=1, AUDIO=1 → 両方同時（本来の動作）
-  * ---------------------------------------------------------- */
- #define CFG_VIDEO_ENABLE    1   /* 1=ON  0=OFF */
- #define CFG_AUDIO_ENABLE    1   /* 1=ON  0=OFF */
-
+ 
+ /* ---- Debug ----------------------------------------------- */
+ #define CFG_VIDEO_ENABLE    1
+ #define CFG_AUDIO_ENABLE    1
+ 
  #endif /* CONFIG_H */
  
