@@ -32,11 +32,12 @@ GND          ──── GND
 > Adding external pull-ups (e.g. 3.3 kΩ) will cause boot failure.
 
 ### Audio Output (LEDC PWM)
+-You can change audio out pin in config.h
 
 Single-stage LPF (minimum):
 ```
-GPIO10 → R=10kΩ ─┬─ C=100nF ─ GND   ← LPF stage 1 (fc ≈ 160 Hz)
-                  └─ C=10μF  ─ Amp input (coupling capacitor)
+GPIO10 → ── 1μF to 33μF ── Speaker
+
 ```
 
 Two-stage LPF (recommended for better quality):
