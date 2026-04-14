@@ -4,3 +4,16 @@ CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ---- Task Watchdog 設定 ----------------------------------------
+# prefill_ring() は 65536 サンプル × vTaskDelay(1) で充填するため
+# 最大 65536ms ≈ 65秒かかる可能性がある。
+# WDT タイムアウトを 30 秒に延長し、アイドルタスクの監視を外す。
+#
+# アイドルタスク WDT 監視を無効化する理由:
+#   SDM モードの sdm_play_task (priority=configMAX_PRIORITIES-1) が
+#   ulTaskNotifyTake() でブロック待機しているため問題ないが、
+#   prefill_ring() 中に vTaskDelay(1) が頻繁に呼ばれる間も
+#   アイドルタスクには確実に制御が渡るので安全。
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set
