@@ -122,13 +122,14 @@ python3 tools/Codec.py -t d \
 
 | Option | Default | Description |
 |-----------|-----------|------|
-| `-t` | Required | `e`=Encode / `d`=Decode |
+| `-t` | Required | `e`=Encode / `d`=Decode  / `c`= c header output |
 | `-p` | Required | BMP directory |
 | `-n` | `frame_` | File name prefix |
 | `-s` | `0001` | Start frame number |
 | `-e` | Required (encode) | End frame number |
 | `-o` | `output.bad` | Output file name |
 | `-i` | Required (decode) | Input .bad file |
+| `-H` | Out put c header file name also bad_data | Input .bad file |
 
 ---
 
