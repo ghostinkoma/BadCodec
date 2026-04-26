@@ -13,7 +13,7 @@ def run_cmd(cmd):
     return subprocess.run(cmd, shell=True)
 
 def get_video_fps(video_path):
-    """ffprobeを使用して動画のフレームレートを取得する"""
+    """ffprobeを使用して動画の本来のフレームレートを取得する"""
     cmd = f'ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of json "{video_path}"'
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     try:
@@ -24,7 +24,7 @@ def get_video_fps(video_path):
             return round(num / den, 2)
         return float(rate)
     except:
-        return 0.0
+        return 25.0  # 取得失敗時のフォールバック
 
 def main():
     parser = argparse.ArgumentParser()
@@ -40,8 +40,9 @@ def main():
     params = {
         "url": "",
         "width": 128, "height": 64, "label": "128x64",
-        "fps": 0.0,              # メタデータから取得するため初期値0
-        "mode": "d",             # d: dither / g: gaussian / b: binary
+        "original_fps": 0.0,
+        "fps": 0.0,
+        "mode": "d",
         "threshold_pct": 50,     
         "gauss_sigma": 1.0, 
         "edge_repair": 3.0,
@@ -68,6 +69,7 @@ def main():
                     else: params[k] = loaded_data[k]
             if params["url"]: is_auto = True
 
+    # --- VIDEO DOWNLOAD (FPS取得のために先にダウンロード) ---
     if not is_auto:
         print("===============================================")
         print("   ESP32-C3 Video & Audio Header Builder       ")
@@ -75,10 +77,28 @@ def main():
         params["url"] = input("\n[1] YouTube URL: ").strip()
         if not params["url"]: return
 
+    # ワークディレクトリ準備
+    res_dir = os.path.normpath(os.path.join(root_dir, "resouce"))
+    inc_dir = os.path.normpath(os.path.join(root_dir, "include"))
+    video_mp4 = os.path.join(res_dir, "download.mp4")
+    os.makedirs(res_dir, exist_ok=True)
+
+    # まず動画をダウンロード
+    run_cmd(f'yt-dlp -f "bestvideo[height<=480]+bestaudio/best" --merge-output-format mp4 -o "{video_mp4}" {params["url"]}')
+    
+    # 本来のFPSを取得
+    params["original_fps"] = get_video_fps(video_mp4)
+
+    if not is_auto:
         sizes = [("64x32", 64, 32), ("72x40", 72, 40), ("128x64", 128, 64), ("256x128", 256, 128), ("230x240", 230, 240)]
         for i, (l, _, _) in enumerate(sizes, 1): print(f"  {i}: {l}")
         idx = int(input("Choice [3]: ") or "3") - 1
         params["label"], params["width"], params["height"] = sizes[idx]
+        
+        # FPS変換の入力
+        print(f"\n[1.5] Frame Rate Setting:")
+        print(f"    - Original FPS: {params['original_fps']}")
+        params["fps"] = float(input(f"    - Change FPS to [{params['original_fps']}]: ") or params["original_fps"])
         
         m_input = input("\n[2] Mode (d: dither / g: gaussian / b: binary) [d]: ").lower() or "d"
         params["mode"] = m_input[0] if m_input[0] in ['d', 'g', 'b'] else 'd'
@@ -96,30 +116,20 @@ def main():
         params["audio_gain_db"] = float(input("\n[4] Audio - Gain (dB) [0.0]: ") or "0.0")
         params["sample_rate"] = round(int(input("    Sample Rate [18000]: ") or "18000") / 500) * 500
 
-    # --- ワークフォルダの完全クリーンアップ ---
-    res_dir = os.path.normpath(os.path.join(root_dir, "resouce"))
-    inc_dir = os.path.normpath(os.path.join(root_dir, "include"))
+    # フォルダ再構築
     frames_dir = os.path.join(res_dir, "Frames", params["label"])
     temp_gray_dir = os.path.join(res_dir, "temp_gray")
-
     for target in [frames_dir, temp_gray_dir]:
         if os.path.exists(target): shutil.rmtree(target)
         os.makedirs(target, exist_ok=True)
     os.makedirs(inc_dir, exist_ok=True)
 
-    video_mp4 = os.path.join(res_dir, "download.mp4")
     temp_bad, temp_wav = os.path.join(res_dir, "output.bad"), os.path.join(res_dir, "audio.wav")
     codec_py, wave_py = os.path.join(script_dir, "Codec.py"), os.path.join(script_dir, "Wave2AdpcmH.py")
     video_h_out, audio_h_out = os.path.join(inc_dir, "bad_data.h"), os.path.join(inc_dir, "adpcm4.h")
 
-    # --- VIDEO DOWNLOAD & INFO ---
-    run_cmd(f'yt-dlp -f "bestvideo[height<=480]+bestaudio/best" --merge-output-format mp4 -o "{video_mp4}" {params["url"]}')
-    
-    # 動画ヘッダから実測FPSを取得
-    params["fps"] = get_video_fps(video_mp4)
-
-    # Filter 構築 (FPSは取得した値を適用)
-    f_list = [f"scale={params['width']}:{params['height']}", "format=gray"]
+    # --- VIDEO PROCESSING (FPS変換適用) ---
+    f_list = [f"fps={params['fps']}", f"scale={params['width']}:{params['height']}", "format=gray"]
     f_list.append(f"eq=contrast={params['contrast']}:brightness={params['brightness']}")
     f_list.append(f"unsharp=5:5:{params['unsharp']}:5:5:0")
     
@@ -130,12 +140,10 @@ def main():
     run_cmd(f'ffmpeg -y -i "{video_mp4}" -vf "{",".join(f_list)}" -vcodec bmp "{temp_gray_dir}/g_%04d.bmp"')
 
     # 二値化/ドット生成
+    final_vf = "format=monob"
     if params["mode"] == "b":
         thresh_val = int(params["threshold_pct"] * 2.55)
-        lut_expr = f"if(lt(val,{thresh_val}),0,255)"
-        final_vf = f"lutrgb='r={lut_expr}:g={lut_expr}:b={lut_expr}',format=monob"
-    else:
-        final_vf = "format=monob" # ガウス・ディザ
+        final_vf = f"lutrgb='r=if(lt(val,{thresh_val}),0,255):g=if(lt(val,{thresh_val}),0,255):b=if(lt(val,{thresh_val}),0,255)',format=monob"
     
     run_cmd(f'ffmpeg -y -i "{temp_gray_dir}/g_%04d.bmp" -vf "{final_vf}" -vcodec bmp "{frames_dir}/frame_%04d.bmp"')
     shutil.rmtree(temp_gray_dir)
@@ -146,7 +154,6 @@ def main():
     run_cmd(f'{py3} "{codec_py}" -t e -p "{frames_dir}/" -n frame_ -s 0001 -e {len(bmp_list):04d} -o "{temp_bad}"')
     v_comp_size = os.path.getsize(temp_bad)
 
-    # 音声
     a_filters = ["loudnorm=I=-16:TP=-1.5:LRA=11"]
     if params["dynamic_boost_enabled"] == 'y': a_filters.insert(0, "compand=attacks=0:points=-80/-80|-20/-5|-10/-1|0/0")
     if params["audio_gain_db"] != 0: a_filters.insert(0, f"volume={params['audio_gain_db']}dB")
@@ -173,10 +180,10 @@ def main():
     print("\n" + "="*60)
     print(f"   ENCODE FINISHED: {cfg_fn}")
     print("-" * 60)
-    print(f"   Source FPS: {params['fps']}")
+    print(f"   Original FPS: {params['original_fps']}")
+    print(f"   Converted FPS: {params['fps']}")
     print(f"   Mode: {params['mode'].upper()}")
-    print(f"   動画圧縮率 (Raw/Bad): {v_raw_size} / {v_comp_size} ({v_ratio:.2f}%)")
-    print(f"   合計バイナリサイズ  : {total_binary} B ({total_binary/1024/1024:.2f} MB)")
+    print(f"   合計バイナリサイズ: {total_binary} B ({total_binary/1024/1024:.2f} MB)")
     print("="*60)
 
 if __name__ == "__main__":
