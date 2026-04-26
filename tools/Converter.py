@@ -5,11 +5,26 @@ import sys
 import shutil
 import csv
 import argparse
+import json
 from datetime import datetime
 
 def run_cmd(cmd):
     print(f"\n[Running]: {cmd}")
     return subprocess.run(cmd, shell=True)
+
+def get_video_fps(video_path):
+    """ffprobeを使用して動画のフレームレートを取得する"""
+    cmd = f'ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of json "{video_path}"'
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    try:
+        data = json.loads(result.stdout)
+        rate = data['streams'][0]['r_frame_rate']
+        if '/' in rate:
+            num, den = map(int, rate.split('/'))
+            return round(num / den, 2)
+        return float(rate)
+    except:
+        return 0.0
 
 def main():
     parser = argparse.ArgumentParser()
@@ -25,12 +40,17 @@ def main():
     params = {
         "url": "",
         "width": 128, "height": 64, "label": "128x64",
-        "mode": "d",
-        "gauss_sigma": 1.0, "edge_repair": 3.0,
+        "fps": 0.0,              # メタデータから取得するため初期値0
+        "mode": "d",             # d: dither / g: gaussian / b: binary
+        "threshold_pct": 50,     
+        "gauss_sigma": 1.0, 
+        "edge_repair": 3.0,
         "contrast": 1.5, 
-        "brightness": 0.0,  # ブライトネス変数を初期化
+        "brightness": 0.0, 
         "unsharp": 1.5,
-        "audio_gain_db": 0.0, "dynamic_boost_enabled": "y", "sample_rate": 18000,
+        "audio_gain_db": 0.0, 
+        "dynamic_boost_enabled": "y", 
+        "sample_rate": 18000,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -60,87 +80,103 @@ def main():
         idx = int(input("Choice [3]: ") or "3") - 1
         params["label"], params["width"], params["height"] = sizes[idx]
         
-        m_input = input("\n[2] Rendering Mode (d: dither / g: gaussian) [d]: ").lower() or "d"
-        params["mode"] = "g" if m_input.startswith('g') else "d"
-        if params["mode"] == "g":
-            params["gauss_sigma"] = float(input("    - Gaussian Sigma [1.0]: ") or "1.0")
-            params["edge_repair"] = float(input("    - Edge Repair [3.0]: ") or "3.0")
+        m_input = input("\n[2] Mode (d: dither / g: gaussian / b: binary) [d]: ").lower() or "d"
+        params["mode"] = m_input[0] if m_input[0] in ['d', 'g', 'b'] else 'd'
         
-        # --- ビデオ補正入力 (ブライトネスを追加) ---
+        if params["mode"] == "g":
+            params["gauss_sigma"] = float(input("    - Gaussian Sigma (Dot Distribution) [1.0]: ") or "1.0")
+            params["edge_repair"] = float(input("    - Edge Repair (Unsharp) [3.0]: ") or "3.0")
+        elif params["mode"] == "b":
+            params["threshold_pct"] = int(input("    - Binary Threshold (0-100%) [50]: ") or "50")
+        
         params["contrast"] = float(input("\n[3] Enhancement - Contrast [1.5]: ") or "1.5")
-        params["brightness"] = float(input("    Enhancement - Brightness (-1.0 to 1.0) [0.0]: ") or "0.0")
+        params["brightness"] = float(input("    Enhancement - Brightness [0.0]: ") or "0.0")
         params["unsharp"] = float(input("    Enhancement - Basic Unsharp [1.5]: ") or "1.5")
         
         params["audio_gain_db"] = float(input("\n[4] Audio - Gain (dB) [0.0]: ") or "0.0")
         params["sample_rate"] = round(int(input("    Sample Rate [18000]: ") or "18000") / 500) * 500
 
-    # パス設定
+    # --- ワークフォルダの完全クリーンアップ ---
     res_dir = os.path.normpath(os.path.join(root_dir, "resouce"))
     inc_dir = os.path.normpath(os.path.join(root_dir, "include"))
     frames_dir = os.path.join(res_dir, "Frames", params["label"])
     temp_gray_dir = os.path.join(res_dir, "temp_gray")
-    os.makedirs(frames_dir, exist_ok=True); os.makedirs(temp_gray_dir, exist_ok=True); os.makedirs(inc_dir, exist_ok=True)
+
+    for target in [frames_dir, temp_gray_dir]:
+        if os.path.exists(target): shutil.rmtree(target)
+        os.makedirs(target, exist_ok=True)
+    os.makedirs(inc_dir, exist_ok=True)
 
     video_mp4 = os.path.join(res_dir, "download.mp4")
     temp_bad, temp_wav = os.path.join(res_dir, "output.bad"), os.path.join(res_dir, "audio.wav")
     codec_py, wave_py = os.path.join(script_dir, "Codec.py"), os.path.join(script_dir, "Wave2AdpcmH.py")
     video_h_out, audio_h_out = os.path.join(inc_dir, "bad_data.h"), os.path.join(inc_dir, "adpcm4.h")
 
-    # --- 処理実行 ---
+    # --- VIDEO DOWNLOAD & INFO ---
     run_cmd(f'yt-dlp -f "bestvideo[height<=480]+bestaudio/best" --merge-output-format mp4 -o "{video_mp4}" {params["url"]}')
-
-    # Video Filter (brightnessをeqフィルタに反映)
-    f_list = [f"scale={params['width']}:{params['height']}", "format=gray"]
-    if params["mode"] == "g":
-        f_list.append(f"unsharp=5:5:{params['edge_repair']}:5:5:0")
-        f_list.append(f"gblur=sigma={params['gauss_sigma']}")
-    else:
-        f_list.append(f"unsharp=5:5:{params['unsharp']}:5:5:0")
     
-    # ここで contrast と brightness を適用
+    # 動画ヘッダから実測FPSを取得
+    params["fps"] = get_video_fps(video_mp4)
+
+    # Filter 構築 (FPSは取得した値を適用)
+    f_list = [f"scale={params['width']}:{params['height']}", "format=gray"]
     f_list.append(f"eq=contrast={params['contrast']}:brightness={params['brightness']}")
-    f_list.append("lutrgb='r=if(lt(val,32),0,if(gt(val,223),255,val))'")
+    f_list.append(f"unsharp=5:5:{params['unsharp']}:5:5:0")
+    
+    if params["mode"] == "g":
+        f_list.append(f"gblur=sigma={params['gauss_sigma']}")
+        f_list.append(f"unsharp=5:5:{params['edge_repair']}:5:5:0")
     
     run_cmd(f'ffmpeg -y -i "{video_mp4}" -vf "{",".join(f_list)}" -vcodec bmp "{temp_gray_dir}/g_%04d.bmp"')
 
-    final_vf = "format=monob" if params["mode"] == "d" else "threshold=128,format=monob"
+    # 二値化/ドット生成
+    if params["mode"] == "b":
+        thresh_val = int(params["threshold_pct"] * 2.55)
+        lut_expr = f"if(lt(val,{thresh_val}),0,255)"
+        final_vf = f"lutrgb='r={lut_expr}:g={lut_expr}:b={lut_expr}',format=monob"
+    else:
+        final_vf = "format=monob" # ガウス・ディザ
+    
     run_cmd(f'ffmpeg -y -i "{temp_gray_dir}/g_%04d.bmp" -vf "{final_vf}" -vcodec bmp "{frames_dir}/frame_%04d.bmp"')
     shutil.rmtree(temp_gray_dir)
 
-    # --- 後続処理 (エンコード・音声・統計) ---
-    bmp_list = [f for f in os.listdir(frames_dir) if f.endswith('.bmp')]
+    # --- 後続処理 ---
+    bmp_list = sorted([f for f in os.listdir(frames_dir) if f.endswith('.bmp')])
     v_raw_size = sum(os.path.getsize(os.path.join(frames_dir, f)) for f in bmp_list)
     run_cmd(f'{py3} "{codec_py}" -t e -p "{frames_dir}/" -n frame_ -s 0001 -e {len(bmp_list):04d} -o "{temp_bad}"')
     v_comp_size = os.path.getsize(temp_bad)
 
+    # 音声
     a_filters = ["loudnorm=I=-16:TP=-1.5:LRA=11"]
     if params["dynamic_boost_enabled"] == 'y': a_filters.insert(0, "compand=attacks=0:points=-80/-80|-20/-5|-10/-1|0/0")
     if params["audio_gain_db"] != 0: a_filters.insert(0, f"volume={params['audio_gain_db']}dB")
-    
     run_cmd(f'ffmpeg -y -i "{video_mp4}" -af "{",".join(a_filters)}" -vn -ar {params["sample_rate"]} -ac 1 -f wav "{temp_wav}"')
+    
     a_raw_size = os.path.getsize(temp_wav)
     a_comp_size = (a_raw_size - 44) // 4
     run_cmd(f'{py3} "{wave_py}" -i "{temp_wav}" -o "{audio_h_out}" -r {params["sample_rate"]}')
     run_cmd(f'{py3} "{codec_py}" -t c -i "{temp_bad}" -H "{video_h_out}"')
 
-    # 最終統計とCSV保存
+    # レポート
     v_ratio = (v_comp_size / v_raw_size) * 100 if v_raw_size > 0 else 0
-    stats = {
-        "枚数": len(bmp_list),
-        "動画raw容量": f"{v_raw_size} B",
-        "動画圧縮後": f"{v_comp_size} B",
-        "動画圧縮率": f"{v_raw_size}/{v_comp_size} ({v_ratio:.2f}%)",
-        "音声圧縮容量": f"{a_comp_size} B",
-        "合計バイナリサイズ": f"{v_comp_size + a_comp_size} B"
-    }
-    params.update(stats)
+    total_binary = v_comp_size + a_comp_size
+    params.update({
+        "枚数": len(bmp_list), "動画raw容量": f"{v_raw_size} B", "動画圧縮後": f"{v_comp_size} B",
+        "動画圧縮率": f"{v_raw_size}/{v_comp_size} ({v_ratio:.2f}%)", "音声圧縮容量": f"{a_comp_size} B",
+        "合計バイナリサイズ": f"{total_binary} B"
+    })
+
     cfg_fn = f"param_{datetime.now().strftime('%Y%m%d_%H%M%S')}.cfg"
     with open(os.path.join(script_dir, cfg_fn), 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f); [writer.writerow([k, v]) for k, v in params.items()]
 
     print("\n" + "="*60)
-    print(f"   FINISH: {cfg_fn} | Brightness: {params['brightness']}")
-    print(f"   Total Size: {v_comp_size + a_comp_size} B")
+    print(f"   ENCODE FINISHED: {cfg_fn}")
+    print("-" * 60)
+    print(f"   Source FPS: {params['fps']}")
+    print(f"   Mode: {params['mode'].upper()}")
+    print(f"   動画圧縮率 (Raw/Bad): {v_raw_size} / {v_comp_size} ({v_ratio:.2f}%)")
+    print(f"   合計バイナリサイズ  : {total_binary} B ({total_binary/1024/1024:.2f} MB)")
     print("="*60)
 
 if __name__ == "__main__":
