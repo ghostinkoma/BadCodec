@@ -1,19 +1,142 @@
-CONFIG_FREERTOS_HZ=1000
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
-CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_LOG_DEFAULT_LEVEL=3
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+/**
+ * @file  config.h
+ * @brief ESP32-C3 Super Mini + SSD1306 128x64 + LEDC/SDM audio
+ * @version v1.0.0
+ *
+ * 変更点 (v1.0.0):
+ *   - CFG_TARGET_FPS 追加 (0 = .bad ヘッダ値を自動使用)
+ *   - CFG_FRAME_MS 廃止 → FPS 指定に統一
+ *   - CFG_AUDIO_OUTPUT_MODE に 2 (SDM) を追加
+ *   - CFG_AUDIO_SR を 0 (WAV ヘッダ自動) に変更
+ *   - OSD 表示項目 (CPU/FPS/VU) の個別 ON/OFF 追加
+ */
 
-# ---- Task Watchdog 設定 ----------------------------------------
-# prefill_ring() は 65536 サンプル × vTaskDelay(1) で充填するため
-# 最大 65536ms ≈ 65秒かかる可能性がある。
-# WDT タイムアウトを 30 秒に延長し、アイドルタスクの監視を外す。
-#
-# アイドルタスク WDT 監視を無効化する理由:
-#   SDM モードの sdm_play_task (priority=configMAX_PRIORITIES-1) が
-#   ulTaskNotifyTake() でブロック待機しているため問題ないが、
-#   prefill_ring() 中に vTaskDelay(1) が頻繁に呼ばれる間も
-#   アイドルタスクには確実に制御が渡るので安全。
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
-# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set
+ #ifndef CONFIG_H
+ #define CONFIG_H
+ 
+ /* ---- I2C (OLED) ------------------------------------------ */
+ #define CFG_I2C_PORT    I2C_NUM_0
+ #define CFG_I2C_SDA     8
+ #define CFG_I2C_SCL     9
+ #define CFG_I2C_FREQ_HZ 1000000
+ 
+ /* ---- SSD1306 128x64 -------------------------------------- */
+ #define CFG_OLED_ADDR   0x3D
+ #define CFG_PHYS_W      128
+ #define CFG_PHYS_H      64
+ #define CFG_PAGES       8
+ #define CFG_DISP_W      128
+ #define CFG_DISP_H      64
+ #define CFG_X_OFFSET    0
+ #define CFG_Y_OFFSET    0
+ 
+ /* ---- BadCodec video -------------------------------------- */
+ #define CFG_VIDEO_W     128
+ #define CFG_VIDEO_H     64
+ 
+ /* ---- フレームレート指定 -----------------------------------
+  *
+  * CFG_TARGET_FPS
+  *   0  = .bad ファイルヘッダの fps 値を使用 (推奨・デフォルト)
+  *   N  = 整数 fps を強制 (例: 30, 24, 15)
+  *
+  * フレーム間隔 ms は実行時に 1000/fps で自動計算される。
+  * ---------------------------------------------------------- */
+ #define CFG_TARGET_FPS  0   /* 0 = bad ヘッダ値を使用 */
+ 
+ /* ---- Audio 出力モード ------------------------------------
+  *
+  * CFG_AUDIO_OUTPUT_MODE
+  *   0 = SINGLE  シングルエンド PWM (GPIO_P のみ)
+  *   1 = BTL     差動 PWM (GPIO_P 正相 + GPIO_N 逆相)
+  *   2 = SDM     ハードウェア Sigma-Delta 変調 (GPIO_P のみ)
+  *
+  * --- SINGLE 接続 ---
+  *   GPIO10 → R=10kΩ → C=100nF → GND  (LPF fc≈160Hz)
+  *                    → C=10μF  → アンプ入力
+  *
+  * --- BTL 接続 ---
+  *   GPIO10 (正相) → R=10kΩ → BTL アンプ IN+
+  *   GPIO3  (逆相) → R=10kΩ → BTL アンプ IN−
+  *
+  *   BTL ホワイトノイズ対策:
+  *     GPIO3 は UART0_RX 共用のため USB 接続時にノイズが増加する。
+  *     sdkconfig.defaults に以下を追加してUARTログを抑制すること:
+  *       CONFIG_ESP_CONSOLE_NONE=y
+  *       CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+  *     また両ピンと GND 間に C=100nF を追加するとキャリア低減できる。
+  *
+  * --- SDM 接続 (最高 S/N 推奨) ---
+  *   GPIO10 → R=1kΩ → C=47nF → GND  (LPF fc≈3.4kHz)
+  *                  → C=10μF → アンプ入力
+  *
+  *   SDM の特長:
+  *     - ESP32 ハードウェア SDM ペリフェラル使用
+  *     - CPU 使用率ほぼ 0%、FPS への影響なし
+  *     - キャリア ~312kHz → LPF で完全除去
+  *     - BTL ホワイトノイズがない (シングルエンド)
+  *     - 理論 SNR ≈ 84 dB (OSR=8x PCM 相当)
+  * ---------------------------------------------------------- */
+ #define CFG_AUDIO_OUTPUT_MODE   2   /* 0=SINGLE  1=BTL  2=SDM */
+ #define CFG_AUDIO_PIN_P         10  /* 正相 / SDM 出力 GPIO */
+ #define CFG_AUDIO_PIN_N         3   /* 逆相 GPIO (BTL 時のみ) */
+ 
+ /* サンプルレート: 0 = WAV ヘッダ値を自動使用 (推奨)
+  * 非ゼロの場合はこの値で強制上書きする。           */
+ #define CFG_AUDIO_SR    0U   /* 0 = auto from WAV header */
+ 
+ /* Volume: 0=mute, 256=full scale
+  * 歪みが出る場合は 200 程度に下げる。              */
+ #define CFG_AUDIO_VOL   220U
+ 
+ /* ---- Source ---------------------------------------------- */
+ #define CFG_SOURCE_FLASH    1
+ /* #define CFG_SOURCE_SD   1 */
+ #ifdef CFG_SOURCE_SD
+ #  define CFG_SD_FILE       "/sdcard/output.bad"
+ #  define CFG_AUDIO_SD_FILE "/sdcard/adpcm4.wav"
+ #endif
+ 
+ /* ---- Video / Audio 有効化 -------------------------------- */
+ #define CFG_VIDEO_ENABLE    1
+ #define CFG_AUDIO_ENABLE    1
+ 
+ /* ---- OSD 表示設定 ----------------------------------------
+  *
+  * 各項目を個別に ON/OFF できます。
+  * 表示レイアウト (下段から):
+  *   最下段: CPU xx.x%
+  *   その上: FPS xx.x
+  *   その上: VU [バーグラフ]
+  *
+  * CFG_OSD_CPU  1 = CPU 使用率表示
+  * CFG_OSD_FPS  1 = FPS 表示
+  * CFG_OSD_VU   1 = VU メーター表示 (15fps 更新)
+  * ---------------------------------------------------------- */
+ #define CFG_OSD_CPU     1   /* 1=表示  0=非表示 */
+ #define CFG_OSD_FPS     1   /* 1=表示  0=非表示 */
+ #define CFG_OSD_VU      1   /* 1=表示  0=非表示 */
+ 
+ /* VU 更新間隔 (ms) — 1/15 秒 ≈ 66ms */
+ #define CFG_OSD_VU_INTERVAL_MS  33U
+ 
+
+ /* ---- OSD 表示位置 ---------------------------------------- */
+ #define CFG_OSD_Y_CPU   56
+ #define CFG_OSD_Y_FPS   48
+ #define CFG_OSD_Y_VU     8  /* 上部に表示 */
+
+ /* ---- フレームレート補正 -----------------------------------
+  * FRAME_RATE_ADJ: 補正係数 (ppm 単位, 正=速め, 負=遅め)
+  * 例: +500 → 実効FPSを 0.05% 速くして I2C遅延を吸収
+  * ---------------------------------------------------------- */
+ #define CFG_FRAME_RATE_ADJ   0   /* ppm: 通常は 0 */
+
+ /* ---- ボタン GPIO ------------------------------------------ */
+ #define CFG_BTN_PLAY    4
+ #define CFG_BTN_OSD     5
+ #define CFG_BTN_VOL_UP  6
+ #define CFG_BTN_VOL_DN  7
+
+ #endif /* CONFIG_H */
+ 
