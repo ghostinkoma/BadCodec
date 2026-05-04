@@ -139,5 +139,10 @@
                        uint32_t cpu_x10,
                        uint16_t vu_raw);
  
+void osd_layer_clear(void);
+void osd_layer_blit(void);
+void osd_draw_vol(uint8_t vol_step);
+void osd_draw_pause(void);
+
  #endif /* DRAW_H */
  
