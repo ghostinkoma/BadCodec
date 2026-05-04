@@ -1,19 +1,15 @@
 /**
  * @file  adpcm_drv.h
- * @brief IMA ADPCM decoder + audio output driver (public API)
- * @version v3.0.0
+ * @brief IMA ADPCM decoder + LEDC PWM / Hardware SDM audio output
+ * @version v1.0.0
  *
- * !! config.h を include しない !!
- *    adpcm_drv.h → config.h → adpcm_drv.h の循環 include を防ぐため
- *    config.h は adpcm_drv.c のみが include する。
+ * Signal chain (mode=SINGLE/BTL):
+ *   Flash WAV (IMA-ADPCM 4-bit) -> PCM ring buffer
+ *   -> gptimer ISR ~16kHz -> LEDC duty update -> GPIO PWM
  *
- * Signal chain (CFG_AUDIO_OUTPUT_MODE=0 SINGLE / 1 BTL):
- *   Flash WAV → PCM ring → gptimer ISR → ledc_set_duty() → GPIO PWM
- *
- * Signal chain (CFG_AUDIO_OUTPUT_MODE=2 SDM):
- *   Flash WAV → PCM ring → gptimer ISR → TaskNotify → sdm_task →
- *   sdm_channel_set_duty() → HW SDM → GPIO
- *   (ISR から Flash 関数を呼べないため TaskNotify 経由)
+ * Signal chain (mode=SDM):
+ *   Flash WAV (IMA-ADPCM 4-bit) -> PCM ring buffer
+ *   -> gptimer ISR ~SR Hz -> sdm_channel_set_duty() -> HW SDM -> GPIO
  */
 
  #ifndef ADPCM_DRV_H
@@ -22,37 +18,45 @@
  #include <stdint.h>
  #include "freertos/FreeRTOS.h"
  #include "freertos/semphr.h"
- /* config.h は include しない */
+ /* config.h はここでインクルードしない。
+  * adpcm_drv.h → config.h → adpcm_drv.h の循環 include を防ぐため。
+  * CFG_* は adpcm_drv.c が config.h を先頭で include して使用する。 */
+
+ /* WAV fmt chunk offsets */
+ #define WAV_FMT_AUDIO_FORMAT_OFF    8U
+ #define WAV_FMT_SAMPLE_RATE_OFF    12U
+ #define WAV_FMT_BLOCK_ALIGN_OFF    20U
+ #define WAV_FMT_IMA_ADPCM       0x0011U
  
- /* リングバッファサイズ: 65536 samples = 4.1 sec @ 16kHz */
+ /* Ring buffer: 65536 samples = 4.1sec @ 16kHz */
  #define ADPCM_RING_SIZE  65536U
  
- /* ADPCM デコーダ内部状態 */
+ /* Public API */
+ int  adpcm_init(const uint8_t *adpcm_data, uint32_t adpcm_size,
+                 SemaphoreHandle_t video_sem);
+ void adpcm_rewind(void);
+ 
+ /** フレーム間隔設定 ms 単位 (後方互換) */
+ void adpcm_set_frame_ms(uint32_t ms);
+
+/** フレーム間隔設定 μs 単位 (高精度・推奨)
+ *  29.97fps → 33366μs  25fps → 40000μs
+ *  内部で sample_rate * frame_us / 1000000 を計算するため
+ *  ms 単位より精度が高い。                               */
+ void adpcm_set_frame_us(uint32_t us);
+ 
+ /* VU レベル取得 (draw モジュールから参照)
+  * 戻り値: 0〜32767 (直近サンプルの絶対値ピーク)         */
+ uint16_t adpcm_get_vu(void);
+ 
+ /* 実際のサンプルレートを返す (WAV ヘッダ解析後に有効)   */
+ uint32_t adpcm_get_sample_rate(void);
+ 
+ /* ADPCM デコーダ内部状態 (adpcm_drv.c 内部使用)        */
  typedef struct {
      int16_t predictor;
      int8_t  step_index;
  } adpcm_state_t;
- 
- /* ---- Public API ------------------------------------------ */
- 
- /**
-  * 初期化。adpcm_data=NULL のとき adpcm4.h の bad_audio_data を使用。
-  * 成功=0, 失敗=-1
-  */
- int adpcm_init(const uint8_t *adpcm_data, uint32_t adpcm_size,
-                SemaphoreHandle_t video_sem);
- 
- /** 先頭に巻き戻して再生を再開する (ループ用) */
- void adpcm_rewind(void);
- 
- /** フレーム間隔 [ms] を設定する。bad_init() 後に main.c から呼ぶ。 */
- void adpcm_set_frame_ms(uint32_t ms);
- 
- /** VU ピーク値を返す [0-32767]。呼ぶたびに減衰する。 */
- uint16_t adpcm_get_vu(void);
- 
- /** WAV ヘッダから取得したサンプルレートを返す */
- uint32_t adpcm_get_sample_rate(void);
  
  #endif /* ADPCM_DRV_H */
  
