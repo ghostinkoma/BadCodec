@@ -211,35 +211,51 @@
          ESP_LOGE(TAG,"bad_init failed"); show_error();
      }
  
-     /* ---- フレームレート決定 --------------------------------
-      * CFG_TARGET_FPS == 0: .bad ヘッダから取得
-      * CFG_TARGET_FPS != 0: 指定値を使用
-      * -------------------------------------------------------- */
-     uint32_t fps = 0;
- #if (CFG_TARGET_FPS != 0)
-     fps = (uint32_t)CFG_TARGET_FPS;
+    /* ---- フレームレート決定 (小数点第2位対応) ---------------
+     *
+     * CFG_TARGET_FPS_100: fps × 100 の整数値
+     *   0    = デフォルト 30.00fps
+     *   2997 = 29.97fps (NTSC)
+     *   2500 = 25.00fps (PAL)
+     *   3000 = 30.00fps
+     *
+     * フレーム間隔 μs = 100000000 / CFG_TARGET_FPS_100
+     *   → 29.97fps: 100000000/2997 = 33366μs (誤差 0.003%)
+     *   → 25.00fps: 100000000/2500 = 40000μs (誤差 0%)
+     * -------------------------------------------------------- */
+    /* fps_100 = fps × 100 */
+ #if defined(CFG_TARGET_FPS_100) && (CFG_TARGET_FPS_100 != 0)
+     uint32_t fps_100 = (uint32_t)CFG_TARGET_FPS_100;
+ #elif defined(CFG_TARGET_FPS) && (CFG_TARGET_FPS != 0)
+     /* 旧マクロ互換 */
+     uint32_t fps_100 = (uint32_t)CFG_TARGET_FPS * 100U;
  #else
-     /* bad_ctx_t に fps フィールドがある場合は使用。
-      * ない場合はデフォルト 34fps (29ms) を使用する。
-      * (bad_decode.h に total_frames はあるが fps は版依存)    */
-     if (s_ctx.total_frames > 0) {
-         /* fps フィールドが存在すれば ctx.fps を使う。
-          * 現バージョンの bad_decode.h には fps がないため
-          * デフォルト 34fps を使用。必要に応じて追加してください。 */
-         fps = 34U;  /* デフォルト: 34fps ≈ 29ms/frame */
-     }
+     uint32_t fps_100 = 3000U;  /* デフォルト 30.00fps */
  #endif
-     if (fps == 0) fps = 34U;
-     s_frame_ms = 1000U / fps;
-     if (s_frame_ms == 0) s_frame_ms = 1;
+     if (fps_100 == 0U) { fps_100 = 3000U; }
+
+     /* フレーム間隔 μs (高精度: fps×100 で計算) */
+     uint32_t frame_interval_us = 100000000U / fps_100;
+     if (frame_interval_us == 0U) { frame_interval_us = 1U; }
+
+     /* adpcm_set_frame_ms に渡す値 (ms 単位, 切り上げ防止で μs/1000) */
+     s_frame_ms = frame_interval_us / 1000U;
+     if (s_frame_ms == 0U) { s_frame_ms = 1U; }
+
+     /* adpcm の ISR フレーム同期は μs 精度で計算するため
+      * frame_interval_us を直接渡す専用 API を使用する。
+      * 旧 adpcm_set_frame_ms() は ms 単位のため誤差が出る。 */
+     ESP_LOGI(TAG,"fps=%.2f interval=%"PRIu32"us frame_ms=%"PRIu32,
+              (float)fps_100/100.0f, frame_interval_us, s_frame_ms);
  
-     ESP_LOGI(TAG,"%ux%u  %u frames  fps=%"PRIu32"  frame_ms=%"PRIu32,
+     ESP_LOGI(TAG,"%ux%u  %u frames  fps=%.2f  frame_ms=%"PRIu32,
               s_ctx.width, s_ctx.height,
-              s_ctx.total_frames, fps, s_frame_ms);
+              s_ctx.total_frames, (float)fps_100/100.0f, s_frame_ms);
  
      /* 音声ドライバにフレーム間隔を通知 */
  #if (CFG_AUDIO_ENABLE == 1)
-     adpcm_set_frame_ms(s_frame_ms);
+     /* μs精度でフレーム同期を設定 (29.97fps等に対応) */
+     adpcm_set_frame_us(frame_interval_us);
  #endif
  
  #else
