@@ -115,7 +115,10 @@ static uint32_t          s_sample_rate;
 static uint32_t          s_read_pos;
 static SemaphoreHandle_t s_video_sem;
 static gptimer_handle_t  s_gptimer;
-static volatile uint32_t s_frame_interval_ms;
+static volatile uint32_t s_frame_interval_ms; /* ms単位 (後方互換) */
+static volatile uint32_t s_frame_interval_us; /* μs単位 (高精度) */
+/* 0 でない方を優先使用: us > ms */
+
 static volatile uint32_t s_isr_samples;
 static volatile uint32_t s_frames_given;
 static volatile uint16_t s_vu_peak;
@@ -126,7 +129,8 @@ static TaskHandle_t          s_sdm_task_hdl;
 #endif
 
 /* ---- Public API ------------------------------------------- */
-void     adpcm_set_frame_ms(uint32_t ms) { s_frame_interval_ms = ms; }
+void     adpcm_set_frame_ms(uint32_t ms) { s_frame_interval_ms = ms; s_frame_interval_us = 0U; }
+void     adpcm_set_frame_us(uint32_t us) { s_frame_interval_us = us; s_frame_interval_ms = 0U; }
 uint32_t adpcm_get_sample_rate(void)     { return s_sample_rate; }
 uint16_t adpcm_get_vu(void)
 {
@@ -353,9 +357,18 @@ static IRAM_ATTR bool audio_isr_cb(gptimer_handle_t timer,
 
     /* フレーム同期 */
     s_isr_samples++;
-    uint32_t fms = s_frame_interval_ms;
-    if (fms > 0U) {
-        uint32_t spf = (s_sample_rate * fms) / 1000U;
+    /* フレーム同期: μs 優先 (高精度)、なければ ms を使用 */
+    {
+        uint32_t spf = 0U;
+        if (s_frame_interval_us > 0U) {
+            /* μs 単位: spf = sr * interval_us / 1000000 */
+            spf = (uint32_t)(
+                (uint64_t)s_sample_rate * s_frame_interval_us
+                / 1000000ULL);
+        } else if (s_frame_interval_ms > 0U) {
+            /* ms 単位: spf = sr * interval_ms / 1000 */
+            spf = (s_sample_rate * s_frame_interval_ms) / 1000U;
+        }
         if (spf > 0U) {
             uint32_t fn = s_isr_samples / spf;
             while (s_frames_given < fn) {
@@ -465,7 +478,8 @@ int adpcm_init(const uint8_t *adpcm_data, uint32_t adpcm_size,
     s_ring_wr    = s_ring_rd    = 0;
     s_isr_samples= s_frames_given = 0;
     s_vu_peak    = 0;
-    s_frame_interval_ms = 29U;
+    s_frame_interval_ms = 0U;
+    s_frame_interval_us = 0U;
     s_gptimer    = NULL;
 #if (CFG_AUDIO_OUTPUT_MODE == 2)
     s_sdm_ch     = NULL;
