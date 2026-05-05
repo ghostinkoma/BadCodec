@@ -21,6 +21,7 @@
  */
 
 #include "button.h"
+#include "config.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -167,7 +168,14 @@ uint16_t button_get_vol(void)
 void button_init(uint8_t vol_default_step)
 {
     memset(&g_btn, 0, sizeof(g_btn));
-    g_btn.osd_mask = 0x07U;   /* 初期値: CPU/FPS/VU 全表示 */
+    /* OSD 初期マスクを config.h から生成
+     * bit0=CPU bit1=FPS bit2=VU
+     * CFG_OSD_CPU/FPS/VU が 1 のビットだけ立てる */
+    g_btn.osd_mask = (uint8_t)(
+        ((CFG_OSD_CPU) ? 0x01U : 0x00U) |
+        ((CFG_OSD_FPS) ? 0x02U : 0x00U) |
+        ((CFG_OSD_VU)  ? 0x04U : 0x00U)
+    );
     g_btn.vol_step = vol_default_step;
     g_btn.paused   = 0;
 
