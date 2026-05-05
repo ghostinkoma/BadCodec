@@ -58,6 +58,11 @@ extern btn_state_t g_btn;
 /**
  * ボタンモジュール初期化。
  * GPIO を内部プルアップ入力として設定し、定期チェックタスクを起動する。
+ *
+ * OSD 初期状態は config.h の CFG_OSD_CPU/FPS/VU から自動生成する。
+ *   CFG_OSD_CPU=1, CFG_OSD_FPS=1, CFG_OSD_VU=0 の場合:
+ *   g_btn.osd_mask = 0x03 (CPU+FPS のみ表示)
+ *
  * vol_default: config.h の CFG_AUDIO_VOL をステップ値に変換して使用。
  */
 void button_init(uint8_t vol_default_step);
