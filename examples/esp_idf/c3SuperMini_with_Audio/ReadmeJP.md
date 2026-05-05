@@ -7,211 +7,395 @@
 [![License](https://img.shields.io/badge/license-Non--Commercial-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-pre--release-orange)]()
 
-> **Pre-release**: エンコード/デコード整合性テストが完了するまで 0.x.x を維持します。
+# BadCodecPlayer for ESP32-C3 Super Mini
+
+**BadCodec v0.6.0 / Protocol 514 / ESP-IDF v5.0.2**
+
+[English](#english) | [日本語](#japanese)
 
 ---
 
-## 概要
+<a name="japanese"></a>
+## 日本語
 
-BadCodec は LGT8F328（RAM 2KB）等の極低スペックマイコン上で  
-モノクロ2値動画をリアルタイム再生するためのコーデックです。
+### 概要
 
-**設計思想：**
+ESP32-C3 Super Mini + SSD1306 128×64 OLED で、IMA-ADPCM 音声付き BadCodec 動画をリアルタイム再生するプレーヤーです。外部 DAC・WiFi・BT を一切使わず、抵抗とコンデンサのみで音声出力します。
 
+**対応コンテンツ例:**
+- Bad Apple!! (30fps)
+- Take On Me MV (25fps / 29.97fps)
+
+---
+
+### ハードウェア構成
+
+| 部品 | 仕様 |
+|---|---|
+| MCU | ESP32-C3 Super Mini (160MHz, RISC-V, 320KB RAM, 4MB Flash) |
+| ディスプレイ | SSD1306 128×64 OLED (I2C) |
+| 音声出力 | LEDC PWM → RC LPF → アンプ (最大4ピン並列) |
+
+#### GPIO 割り当て
+
+| GPIO | 機能 |
+|---|---|
+| 8 | I2C SDA (OLED) |
+| 9 | I2C SCL (OLED) |
+| 10 | 音声出力 P (正相・必須) |
+| 3 | 音声出力 N (BTL 逆相時のみ) |
+| 4 | ボタン PLAY/PAUSE |
+| 5 | ボタン OSD ON/OFF |
+| 6 | ボタン VOL+ |
+| 7 | ボタン VOL− |
+
+#### 音声出力回路
+
+**SINGLE モード (mode=0, 推奨):**
 ```
-- 1バイト命令体系   オペコード1バイトで即命令確定
-- 前フレームバッファ1枚のみ   動的メモリ確保なし
-- ビット演算のみ   乗除算・浮動小数点なし
-- Fletcher-16 チェックサム   加算のみ・RAM 2B
-- read コールバック   Flash/SD/SPIFFS/LittleFS を抽象化
+GPIO10 → R=10kΩ → C=100nF→GND
+                → C=10μF → アンプ入力
 ```
 
----
-
-## 実績圧縮率
-
+**並列出力 (音圧増強):**
 ```
-Bad Apple!! 128x64 / 6572フレーム / 2値モノクロ / ロスレス
-
-  非圧縮     : 6.42 MB  (100%)
-  BadCodec   : 0.93 MB  (14.4%)  6.92x
-
-制約条件:
-  符号化なし (Huffman / 算術符号 等 不使用)
-  辞書圧縮なし (LZ77 / LZW 等 不使用)
-  LGT8F328 (2KB RAM) でリアルタイムデコード可能
-
-この制約下での 1MB 未満達成は極めて稀。
+GPIO10 → R=10kΩ ┐
+GPIO4  → R=10kΩ ├→ C=100nF→GND / C=10μF→アンプ
+GPIO5  → R=10kΩ ┘
 ```
+各ピンに必ず個別の R=10kΩ を入れること。並列直結は禁止。
 
----
-
-## ターゲットプラットフォーム
-
-| ターゲット | CPU | RAM | 推奨解像度 |
-|-----------|-----|-----|----------|
-| LGT8F328（ミニマム） | AVR互換 32MHz | 2KB | 128×64 |
-| ESP32-Cx（標準） | RISC-V 160MHz | 400KB | 320×240以下 |
-| RP2350（マキシマム） | Cortex-M33 150MHz | 520KB | 640×480以下 |
-
----
-
-## 命令体系（Protocol 514）
-
-### フレームレベル命令
-
-| 命令 | オペコード | 説明 |
-|------|-----------|------|
-| RLE_FRAME | 0x30-0x37 | フレーム全体RLE・8走査パターン |
-| SKIP_FRAME | 0x39 | 前フレームをそのまま維持 |
-| FRAME_FILL_BLACK | 0x3A | 全画素を黒で塗りつぶす |
-| FRAME_FILL_WHITE | 0x3B | 全画素を白で塗りつぶす |
-| BLOCK_STREAM | 0x3C | ブロック命令列 |
-| DELTA_FRAME | 0x3D | XOR差分フレームRLE・8走査パターン |
-| MASTER_FRAME | 0x3E | rawビットデータ |
-| INVERT_PREV_FRAME | 0x3F | 前フレーム全ビット反転 |
-
-### ブロックレベル命令
-
-| 命令 | オペコード | サイズ | 説明 |
-|------|-----------|--------|------|
-| SKIP_BLOCK | 0x80-0xBF | 1B | 前フレームコピー (1-64ブロック) |
-| FILL_BLOCK | 0x30-0x37 | 1B | 単色塗りつぶし (1-4ブロック) |
-| BLOCK_INVERT | 0x00-0x1F | 1B | 前フレーム反転 (1-32ブロック) |
-| SHIFT_BIT | 0x40-0x7F | 1B | ±3ドット微小移動差分 |
-| RLE_BLOCK_4 | 0x20-0x2F | 4B | 8方向RLE・4ラン |
-| RLE_BLOCK_8 | 0x38-0x3B,0x3D-0x3E | 7B | 拡張RLE・8ラン |
-| XOR_BLOCK | 0x3F | 2+NB | prev XOR差分RLE |
-| MASTER_BLOCK | 0x3C | 9B | rawビットデータ |
-| FOR | 0xC0-0xFF | 2B | 次命令を4-65回繰り返す (最小repeat=4) |
-
----
-
-## インストール
-
-```bash
-git clone https://github.com/ghostinkoma/BadCodec.git
-cd BadCodec
-pip install Pillow numpy
+**BTL モード (mode=1):**
+```
+GPIO10 (正相) → R=10kΩ → BTL アンプ IN+
+GPIO3  (逆相) → R=10kΩ → BTL アンプ IN−
 ```
 
 ---
 
-## 使い方
+### ソフトウェア構成
+
+```
+src/
+├── main.c          プレーヤー本体 (v3.1.0)
+├── adpcm_drv.c/h   IMA-ADPCM デコーダ + LEDC PWM 音声ドライバ (v4.0.0)
+├── bad_decode.c/h  BadCodec デコーダ (v0.5.1 / Protocol 514)
+├── draw.c/h        描画モジュール + OSD レイヤー
+├── button.c/h      ボタン入力 (GPIO 内部プルアップ、チャタリング除去)
+├── ssd1306_drv.c/h SSD1306 I2C ドライバ
+├── font.h          8×8 等幅フォント
+└── config.h        全設定値
+tools/
+└── Codec.py        BadCodec エンコーダ / デコーダ / C ヘッダ出力
+```
+
+---
+
+### config.h 主要設定
+
+```c
+/* I2C */
+#define CFG_I2C_FREQ_HZ   1000000      /* 1MHz (動作実績あり) */
+
+/* フレームレート (fps × 100 で指定、小数点第2位まで対応) */
+#define CFG_TARGET_FPS_100  2500       /* 25.00fps (PAL) */
+// 2997 = 29.97fps (NTSC)
+// 3000 = 30.00fps
+// 2400 = 24.00fps (映画)
+
+/* 音声出力モード */
+#define CFG_AUDIO_OUTPUT_MODE  0       /* 0=SINGLE 1=BTL */
+#define CFG_AUDIO_PIN_P        10      /* 正相 GPIO (必須) */
+#define CFG_AUDIO_PIN_N        3       /* 逆相 GPIO (BTL 時) */
+
+/* 並列出力ピン (0=無効) */
+#define CFG_AUDIO_PIN_P2  0            /* 例: 4 */
+#define CFG_AUDIO_PIN_P3  0            /* 例: 5 */
+#define CFG_AUDIO_PIN_P4  0            /* 例: 6 */
+
+/* 音量 0=無音 256=フルスケール */
+#define CFG_AUDIO_VOL  220U
+
+/* OSD 表示 */
+#define CFG_OSD_CPU  1
+#define CFG_OSD_FPS  1
+#define CFG_OSD_VU   1
+```
+
+---
+
+### アーキテクチャ
+
+#### 音声同期方式
+```
+gptimer ISR (16kHz)
+  → LEDC duty 更新 (IRAM 配置、ISR から安全)
+  → s_isr_samples カウント
+  → samples / spf == 新フレーム番号 → xSemaphoreGiveFromISR()
+  → player_task が xSemaphoreTake() でフレームタイミングを受け取る
+```
+
+フレーム間隔は `adpcm_set_frame_us()` で μs 単位設定。  
+29.97fps = 33366μs → 誤差 0.003%。
+
+#### 音声バッファ設計 (v4.0.0)
+```
+adpcm_decode_task:
+  フェーズ1 (prefill): リングが 75% 以上になるまで連続デコード
+                        → s_prefill_done=1
+  adpcm_init():         s_prefill_done を待機してから gptimer 起動
+  フェーズ2 (通常):     ring_full なら vTaskDelay(1) で待機しながら継続
+```
+- ライターは常に `adpcm_decode_task` のみ（二重ライター競合なし）
+- ブロック境界を必ず守る → テンポずれなし
+
+#### OSD レイヤー設計
+```
+映像バッファ g_fb[1024]      ← ssd1306_blit_gram() が書く
+OSD レイヤー s_osd_layer[1024] ← OSD 専用
+
+描画順:
+  g_fb ← clear + blit_gram
+  s_osd_layer ← clear + OSD 描画
+  g_fb ^= s_osd_layer  (INVERT 重畳)
+  ssd1306_flush()
+```
+ボタン押下タイミングで画面が乱れない構造。
+
+---
+
+### ボタン操作
+
+| ボタン | GPIO | 機能 | チャタリング |
+|---|---|---|---|
+| PLAY/PAUSE | 4 | 映像+音声同時停止/再開、中央 PAUSE 点滅 | 150ms |
+| OSD | 5 | CPU/FPS/VU 表示を 3bit 順次トグル | 150ms |
+| VOL+ | 6 | 音量+ (16段階)、1.5秒バー表示 | 80ms |
+| VOL− | 7 | 音量− (16段階)、1.5秒バー表示 | 80ms |
+
+ボタン未接続でも動作（常時 HIGH = 非押下）。内部プルアップ使用。
+
+---
 
 ### エンコード
 
 ```bash
-python3 tools/Codec.py -t e \
-  -p ./frames \
-  -n frame_ \
-  -s 0001 \
-  -e 6572 \
-  -o output.bad
+# BMP → .bad エンコード
+python3 tools/Codec.py -t e -p ./frames -n frame_ -s 0001 -e 6572 -o output.bad
+
+# .bad → C ヘッダ
+python3 tools/Codec.py -t c -i output.bad -H bad_data.h
+
+# 音声変換 (IMA-ADPCM WAV → C ヘッダ)
+python3 tools/Wave2adpcmH.py -i audio.wav -o adpcm4.h
 ```
 
-### デコード
+---
+
+### ビルド
 
 ```bash
-python3 tools/Codec.py -t d \
-  -i output.bad \
-  -p ./out \
-  -n frame_ \
-  -s 0001
+# PlatformIO (推奨)
+pio run --target upload --environment esp32c3-supermini
+
+# ESP-IDF
+idf.py build flash monitor
 ```
 
-### オプション
-
-| オプション | デフォルト | 説明 |
-|-----------|-----------|------|
-| `-t` | 必須 | `e`=エンコード / `d`=デコード |
-| `-p` | 必須 | BMPディレクトリ |
-| `-n` | `frame_` | ファイル名接頭辞 |
-| `-s` | `0001` | 開始フレーム番号 |
-| `-e` | 必須(encode) | 終了フレーム番号 |
-| `-o` | `output.bad` | 出力ファイル名 |
-| `-i` | 必須(decode) | 入力.badファイル |
+**メモリ使用量 (実測):**
+```
+RAM:   43.3% (142KB / 320KB)
+Flash: 87.6% (3.6MB / 4MB)
+```
 
 ---
 
-## マイコン向けデコーダ
+### 既知のバグ / 制限事項
 
-`tools/bad_decode.h` / `tools/bad_decode.cpp` を使用します。
+- SDM モード (mode=2) は廃止。ISR から Flash 関数呼び出し不可の根本問題により削除。
+- FPS 自動検出は未実装。`config.h` の `CFG_TARGET_FPS_100` を手動設定すること。
+- `bad_ctx_t` に fps フィールドがないため自動取得不可（将来版で対応予定）。
+
+---
+
+
+### ライセンス
+
+BadCodec: Non-Commercial Use Only (ghostinkoma@gmail.com)
+
+---
+
+<a name="english"></a>
+## English
+
+### Overview
+
+A real-time BadCodec video player with IMA-ADPCM audio for ESP32-C3 Super Mini + SSD1306 128×64 OLED. No external DAC, WiFi, or Bluetooth required — audio output via resistor + capacitor only.
+
+**Tested content:**
+- Bad Apple!! (30fps)
+- Take On Me MV (25fps / 29.97fps)
+
+---
+
+### Hardware
+
+| Component | Spec |
+|---|---|
+| MCU | ESP32-C3 Super Mini (160MHz, RISC-V, 320KB RAM, 4MB Flash) |
+| Display | SSD1306 128×64 OLED (I2C @ 1MHz) |
+| Audio | LEDC PWM → RC LPF → amplifier (up to 4 parallel pins) |
+
+#### GPIO Assignment
+
+| GPIO | Function |
+|---|---|
+| 8 | I2C SDA (OLED) |
+| 9 | I2C SCL (OLED) |
+| 10 | Audio P (positive, required) |
+| 3 | Audio N (BTL negative only) |
+| 4 | Button PLAY/PAUSE |
+| 5 | Button OSD toggle |
+| 6 | Button VOL+ |
+| 7 | Button VOL− |
+
+#### Audio Circuit
+
+**SINGLE mode (mode=0, recommended):**
+```
+GPIO10 → R=10kΩ → C=100nF→GND
+                → C=10μF → amp input
+```
+
+**Parallel output (louder):**
+```
+GPIO10 → R=10kΩ ┐
+GPIO4  → R=10kΩ ├→ C=100nF→GND / C=10μF→amp
+GPIO5  → R=10kΩ ┘
+```
+Each pin **must** have its own series resistor. Never connect in parallel directly.
+
+**BTL mode (mode=1):**
+```
+GPIO10 (+) → R=10kΩ → BTL amp IN+
+GPIO3  (−) → R=10kΩ → BTL amp IN−
+```
+
+---
+
+### config.h Key Settings
 
 ```c
-#include "bad_decode.h"
+/* Frame rate: fps × 100 (supports 2 decimal places) */
+#define CFG_TARGET_FPS_100  2997   // 29.97fps (NTSC)
+// 2500 = 25.00fps (PAL)
+// 3000 = 30.00fps
+// 2400 = 24.00fps (film)
 
-static uint8_t   gram[BAD_GRAM_SIZE(128, 64)];
-static uint8_t   prev[BAD_GRAM_SIZE(128, 64)];
-static bad_ctx_t ctx;
+/* Audio output mode */
+#define CFG_AUDIO_OUTPUT_MODE  0   // 0=SINGLE 1=BTL
 
-uint16_t my_read(bad_addr_t off, uint8_t *buf, uint16_t len) {
-    for (uint16_t i = 0; i < len; i++)
-        buf[i] = pgm_read_byte(VIDEO_DATA + off + i);
-    return len;
-}
+/* Parallel output pins (0=disabled) */
+#define CFG_AUDIO_PIN_P2  0        // e.g. 4
+#define CFG_AUDIO_PIN_P3  0        // e.g. 5
+#define CFG_AUDIO_PIN_P4  0        // e.g. 6
 
-void setup() {
-    ctx.read     = my_read;
-    ctx.gram     = gram;
-    ctx.prev     = prev;
-    ctx.buf_size = sizeof(gram);
-    bad_init(&ctx);
-}
-
-void loop() {
-    bad_result_t r = bad_next_frame(&ctx);
-    if (r == BAD_OK)  display_write(ctx.gram);
-    if (r == BAD_EOF) bad_rewind(&ctx);
-}
+/* Volume: 0=mute, 256=full scale */
+#define CFG_AUDIO_VOL  220U
 ```
 
 ---
 
-## ファイルフォーマット
+### Architecture
 
+#### Audio Sync
 ```
-[19バイト ヘッダー]
-  2B: ヘッダーサイズ (固定 19)
-  2B: Fletcher-16 チェックサム
-  3B: マジックナンバー "Bad"
-  2B: プロトコルバージョン (514)
-  2B: カラー数 (2)
-  2B: 画像幅
-  2B: 画像高さ
-  2B: ブロックサイズ (8)
-  2B: 総フレーム数
-
-[フレームデータ]
-  FRAME_DELIMITER(0x38) + フレーム命令 の繰り返し
+gptimer ISR @ sample_rate (e.g. 16kHz)
+  → ledc_set_duty() [IRAM, safe from ISR]
+  → count samples
+  → samples / spf == new frame → xSemaphoreGiveFromISR()
+  → player_task receives timing via xSemaphoreTake()
 ```
 
-詳細は [SPEC.md](SPEC.md) を参照。
+Frame interval set via `adpcm_set_frame_us()` for μs precision.  
+29.97fps = 33366μs → error 0.003%.
+
+#### Double-writer bug fix (v4.0.0)
+- `prefill_ring()` abolished — caused IMA-ADPCM block boundary violation
+- `adpcm_decode_task` is the sole writer to the ring buffer
+- Phase 1 (prefill) runs inside the task before gptimer starts
+- Phase 2 (normal) continues indefinitely
+
+#### OSD Layer
+```
+g_fb[1024]          ← video frame
+s_osd_layer[1024]   ← OSD only
+
+Draw order:
+  g_fb ← clear + blit_gram
+  s_osd_layer ← clear + draw OSD
+  g_fb ^= s_osd_layer   (INVERT blend)
+  ssd1306_flush()
+```
+No screen glitch on button press.
 
 ---
 
-## 開発状況
+### Button Controls
 
-```
-[済] コーデック仕様確定 (SPEC.md rev.18)
-[済] Python エンコーダ/デコーダ (Protocol 514)
-[済] マルチCPU並列エンコード
-[済] Self-Verify 機構
-[済] Cデコーダ (bad_decode.h / bad_decode.cpp)
-[済] FOR最適化 再帰的最適計算 (rev.18)
-[済] DELTA_FRAME (rev.16)
-[済] Cデコーダ実機検証
-[済] エンコード/デコード整合性テストスイート
-[済] FPS自動調整
-[済] 再生スピード自動調整
-[済] OSD機能実装
+| Button | GPIO | Function | Debounce |
+|---|---|---|---|
+| PLAY/PAUSE | 4 | Toggle video+audio, blink PAUSE | 150ms |
+| OSD | 5 | Toggle CPU/FPS/VU display (3-bit) | 150ms |
+| VOL+ | 6 | Volume up (16 steps), show bar 1.5s | 80ms |
+| VOL− | 7 | Volume down (16 steps), show bar 1.5s | 80ms |
+
+Works without buttons connected (internal pull-up, open = not pressed).
+
+---
+
+### Encoding
+
+```bash
+# BMP frames → .bad
+python3 tools/Codec.py -t e -p ./frames -n frame_ -s 0001 -e 6572 -o output.bad
+
+# .bad → C header
+python3 tools/Codec.py -t c -i output.bad -H bad_data.h
+
+# Audio: WAV → IMA-ADPCM C header
+python3 tools/Wave2adpcmH.py -i audio.wav -o adpcm4.h
 ```
 
 ---
 
-## ライセンス
+### Build
 
-非商用利用は自由。商用利用はお問い合わせください。
+```bash
+# PlatformIO (recommended)
+pio run --target upload --environment esp32c3-supermini
 
-**Contact:** ghostinkoma@gmail.com  
-詳細は [LICENSE](LICENSE) を参照。
+# ESP-IDF
+idf.py build flash monitor
+```
+
+**Memory usage:**
+```
+RAM:   43.3% (142KB / 320KB)
+Flash: 87.6% (3.6MB / 4MB)
+```
+
+---
+
+### Known Issues / Limitations
+
+- SDM mode (mode=2) removed — ISR cannot call Flash functions.
+- FPS auto-detection not implemented. Set `CFG_TARGET_FPS_100` manually.
+- `bad_ctx_t` has no fps field (planned for future version).
+
+
+---
+
+### License
+
+BadCodec: Non-Commercial Use Only (ghostinkoma@gmail.com)
