@@ -139,9 +139,28 @@
                        uint32_t cpu_x10,
                        uint16_t vu_raw);
  
+/* ============================================================
+ * OSD レイヤー API (draw.c で実装)
+ *
+ * 使用順序:
+ *   ssd1306_clear();
+ *   ssd1306_blit_gram(...);
+ *   osd_layer_clear();
+ *   frame_osd_update(...) / osd_draw_vol() / osd_draw_pause();
+ *   osd_layer_blit();
+ *   ssd1306_flush();
+ * ============================================================ */
+
+/** OSD レイヤーバッファをゼロクリア */
 void osd_layer_clear(void);
+
+/** OSD レイヤーを g_fb に INVERT で重畳する */
 void osd_layer_blit(void);
+
+/** 音量バー描画 (OSD レイヤー最上段, vol_step: 0-15) */
 void osd_draw_vol(uint8_t vol_step);
+
+/** PAUSE 文字描画 (OSD レイヤー中央, 500ms 点滅) */
 void osd_draw_pause(void);
 
  #endif /* DRAW_H */
