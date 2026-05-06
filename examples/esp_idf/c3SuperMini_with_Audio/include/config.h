@@ -18,7 +18,7 @@
  #define CFG_I2C_PORT    I2C_NUM_0
  #define CFG_I2C_SDA     8
  #define CFG_I2C_SCL     9
- #define CFG_I2C_FREQ_HZ 400000
+ #define CFG_I2C_FREQ_HZ 1000000
  
  /* ---- SSD1306 128x64 -------------------------------------- */
  #define CFG_OLED_ADDR   0x3D
@@ -42,7 +42,10 @@
   *
   * フレーム間隔 ms は実行時に 1000/fps で自動計算される。
   * ---------------------------------------------------------- */
- #define CFG_TARGET_FPS  0   /* 0 = bad ヘッダ値を使用 */
+ /* fps × 100 で指定 (小数点第2位対応)
+  * 2997=29.97fps 2500=25.00fps 3000=30.00fps 2400=24.00fps */
+ #define CFG_TARGET_FPS_100  2398   /* 25.00fps */
+ #define CFG_TARGET_FPS      0      /* 0=CFG_TARGET_FPS_100 を使用 */
  
  /* ---- Audio 出力モード ------------------------------------
   *
@@ -77,9 +80,19 @@
   *     - BTL ホワイトノイズがない (シングルエンド)
   *     - 理論 SNR ≈ 84 dB (OSR=8x PCM 相当)
   * ---------------------------------------------------------- */
- #define CFG_AUDIO_OUTPUT_MODE   1   /* 0=SINGLE  1=BTL */
- #define CFG_AUDIO_PIN_P         10  /* 正相 / SDM 出力 GPIO */
- #define CFG_AUDIO_PIN_N         3   /* 逆相 GPIO (BTL 時のみ) */
+ #define CFG_AUDIO_OUTPUT_MODE   0  /* 0=SINGLE  1=BTL */
+ #define CFG_AUDIO_PIN_P         7  /* 正相 / SDM 出力 GPIO */
+ #define CFG_AUDIO_PIN_N         10   /* 逆相 GPIO (BTL 時のみ) */
+
+ /* ---- 並列出力ピン (最大4本, 0=無効) --------------------
+  * 各ピン独立 R=10kΩ → 合流 → LPF → アンプ
+  * スピーカー直結: C=100μF カップリング
+  * 例: GPIO10/4/5/6 の4本並列 → 電流4倍
+  * -------------------------------------------------------- */
+ #define CFG_AUDIO_PIN_P2  10   /* 並列ピン2 (0=無効, 例:4) */
+ #define CFG_AUDIO_PIN_P3  0   /* 並列ピン3 (0=無効, 例:5) */
+ #define CFG_AUDIO_PIN_P4  0
+    /* 並列ピン4 (0=無効, 例:6) */
  
  /* サンプルレート: 0 = WAV ヘッダ値を自動使用 (推奨)
   * 非ゼロの場合はこの値で強制上書きする。           */
@@ -87,7 +100,7 @@
  
  /* Volume: 0=mute, 256=full scale
   * 歪みが出る場合は 200 程度に下げる。              */
- #define CFG_AUDIO_VOL   220U
+ #define CFG_AUDIO_VOL   255U
  
  /* ---- Source ---------------------------------------------- */
  #define CFG_SOURCE_FLASH    1
