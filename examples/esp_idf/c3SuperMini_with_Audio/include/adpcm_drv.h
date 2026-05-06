@@ -39,11 +39,19 @@
  /** フレーム間隔設定 ms 単位 (後方互換) */
  void adpcm_set_frame_ms(uint32_t ms);
 
-/** フレーム間隔設定 μs 単位 (高精度・推奨)
- *  29.97fps → 33366μs  25fps → 40000μs
- *  内部で sample_rate * frame_us / 1000000 を計算するため
- *  ms 単位より精度が高い。                               */
+/** フレーム間隔設定 μs 単位 (推奨: 29.97fps=33366μs, 誤差0.003%) */
  void adpcm_set_frame_us(uint32_t us);
+
+/** 音量を動的に変更する (0=無音, 256=フルスケール)
+ *  ボタン VOL+/- 押下時に button_get_vol() の値を渡す。
+ *  ISR から参照する s_vol を更新するため即時反映される。 */
+ void adpcm_set_vol(uint16_t vol);
+
+/** 音声を一時停止 (gptimer 停止 + 無音出力) */
+ void adpcm_pause(void);
+
+/** 音声を再開 (gptimer 再起動、カウンタリセット) */
+ void adpcm_resume(void);
  
  /* VU レベル取得 (draw モジュールから参照)
   * 戻り値: 0〜32767 (直近サンプルの絶対値ピーク)         */
