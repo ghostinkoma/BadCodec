@@ -12,8 +12,8 @@
  * 音量ボタン:
  *   vol_step を 0-15 でクランプ。押下中 BTN_VOL_SHOW_MS 間だけ
  *   g_btn.vol_show=1 にして main.c 側で表示制御する。
- *
- * OSD ボタン:
+ */
+ /* OSD ボタン:
  *   g_btn.osd_mask の bit0(CPU)/bit1(FPS)/bit2(VU) を順に
  *   トグル。1回押すごとに次の組み合わせに移行。
  *   実際の表示/非表示は draw.c の CFG_OSD_xxx ではなく
@@ -21,7 +21,6 @@
  */
 
 #include "button.h"
-#include "config.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -113,9 +112,42 @@ static void button_task(void *arg)
                 break;
 
             case ID_OSD:
-                /* 3ビット順次トグル: 000→001→010→011→100→101→110→111→000 */
-                g_btn.osd_mask = (g_btn.osd_mask + 1) & 0x07U;
-                ESP_LOGI(TAG, "OSD mask: 0x%02X", g_btn.osd_mask);
+                /* OSD 表示モードを順次切り替え
+                 * bit0=CPU  bit1=FPS  bit2=VU
+                 * 意味のある 8 パターンを順に切り替える:
+                 *   0x07 全表示 (CPU+FPS+VU)
+                 *   0x06 FPS+VU
+                 *   0x05 CPU+VU
+                 *   0x04 VU のみ
+                 *   0x03 CPU+FPS
+                 *   0x02 FPS のみ
+                 *   0x01 CPU のみ
+                 *   0x00 非表示
+                 * → 0x07 に戻る                                    */
+                {
+                    static const uint8_t osd_seq[] = {
+                        0x07U,  /* CPU+FPS+VU */
+                        0x06U,  /* FPS+VU     */
+                        0x05U,  /* CPU+VU     */
+                        0x04U,  /* VU のみ    */
+                        0x03U,  /* CPU+FPS    */
+                        0x02U,  /* FPS のみ   */
+                        0x01U,  /* CPU のみ   */
+                        0x00U,  /* 非表示     */
+                    };
+                    static const uint8_t osd_seq_len =
+                        (uint8_t)(sizeof(osd_seq)/sizeof(osd_seq[0]));
+                    /* 現在のマスク値からシーケンス内の位置を探す */
+                    uint8_t idx = 0;
+                    for (uint8_t k = 0; k < osd_seq_len; k++) {
+                        if (osd_seq[k] == g_btn.osd_mask) {
+                            idx = (uint8_t)((k + 1U) % osd_seq_len);
+                            break;
+                        }
+                    }
+                    g_btn.osd_mask = osd_seq[idx];
+                    ESP_LOGI(TAG, "OSD mask: 0x%02X", g_btn.osd_mask);
+                }
                 break;
 
             case ID_VOLUP:
@@ -168,14 +200,7 @@ uint16_t button_get_vol(void)
 void button_init(uint8_t vol_default_step)
 {
     memset(&g_btn, 0, sizeof(g_btn));
-    /* OSD 初期マスクを config.h から生成
-     * bit0=CPU bit1=FPS bit2=VU
-     * CFG_OSD_CPU/FPS/VU が 1 のビットだけ立てる */
-    g_btn.osd_mask = (uint8_t)(
-        ((CFG_OSD_CPU) ? 0x01U : 0x00U) |
-        ((CFG_OSD_FPS) ? 0x02U : 0x00U) |
-        ((CFG_OSD_VU)  ? 0x04U : 0x00U)
-    );
+    g_btn.osd_mask = 0x07U;   /* 初期値: CPU/FPS/VU 全表示 */
     g_btn.vol_step = vol_default_step;
     g_btn.paused   = 0;
 
