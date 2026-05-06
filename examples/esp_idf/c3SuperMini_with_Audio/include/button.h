@@ -26,13 +26,13 @@
 #define CFG_BTN_PLAY    4   /* 停止/再生 */
 #endif
 #ifndef CFG_BTN_OSD
-#define CFG_BTN_OSD     5   /* OSD ON/OFF */
+#define CFG_BTN_OSD     3   /* OSD ON/OFF */
 #endif
 #ifndef CFG_BTN_VOL_UP
-#define CFG_BTN_VOL_UP  6   /* 音量+ */
+#define CFG_BTN_VOL_UP  1   /* 音量+ */
 #endif
 #ifndef CFG_BTN_VOL_DN
-#define CFG_BTN_VOL_DN  7   /* 音量− */
+#define CFG_BTN_VOL_DN  2   /* 音量− */
 #endif
 
 /* ---- チャタリング除去時間 --------------------------------- */
