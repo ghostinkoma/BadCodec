@@ -1,15 +1,18 @@
 /**
  * @file  main.c
- * @brief BadCodecPlayer v3.2.0
+ * @brief BadCodecPlayer v3.3.0
  *
- * v3.2.0 変更点:
- *   [1] OSD 初期状態を config.h の CFG_OSD_CPU/FPS/VU から生成
- *       (button_init に vol_step と共に osd_mask 初期値を渡す)
- *   [2] ボタン完全統合: PAUSE/VOL/OSD
- *   [3] OSD レイヤー分離: osd_layer_clear/blit で画面乱れなし
- *   [4] PAUSE: 映像+音声同時停止、中央 PAUSE 点滅
- *   [5] CFG_TARGET_FPS_100 対応 (小数点第2位まで)
- *   [6] adpcm_set_frame_us() で μs 精度フレーム同期
+ * v3.3.0 バグ修正:
+ *   [1] PAUSE で音声も停止
+ *       adpcm_set_frame_ms(0) で gptimer ISR の Give を停止。
+ *       resume 時は adpcm_set_frame_us() で再開。
+ *   [2] OSD マスクを正しく適用
+ *       g_btn.osd_mask bit0=CPU bit1=FPS bit2=VU で
+ *       frame_osd_update() への引数を動的に制御。
+ *       毎フレーム osd_layer_clear() を呼ぶことで残像を防ぐ。
+ *   [3] 音量調整を実機に反映
+ *       button_get_vol() の戻り値を毎フレーム adpcm_set_vol() に渡す。
+ *       vol_step=0 のとき 0 (無音) を渡す。
  */
 
 #include <string.h>
@@ -40,13 +43,13 @@ static TimerHandle_t s_frame_timer;
 static volatile uint32_t s_frame_count = 0;
 static volatile uint32_t s_fps_x10     = 0;
 static volatile uint32_t s_cpu_x10     = 0;
-static uint32_t s_frame_ms = 33U;
+static uint32_t s_frame_ms  = 33U;
+static uint32_t s_frame_us  = 33333U;
 
 /* ---- ソフトタイマ (音声無効時フォールバック) -------------- */
 static void frame_timer_cb(TimerHandle_t t)
 {
-    (void)t;
-    xSemaphoreGive(s_video_sem);
+    (void)t; xSemaphoreGive(s_video_sem);
 }
 static void start_sw_frame_timer(void)
 {
@@ -60,8 +63,7 @@ static void start_sw_frame_timer(void)
 #ifdef CFG_SOURCE_FLASH
 static uint16_t flash_read(bad_addr_t off, uint8_t *buf, uint16_t len)
 {
-    memcpy(buf, bad_data + off, len);
-    return len;
+    memcpy(buf, bad_data + off, len); return len;
 }
 #endif
 
@@ -108,7 +110,7 @@ static void show_error(void)
 }
 
 /* ============================================================
- * stats_task  FPS / CPU 計測
+ * stats_task
  * ============================================================ */
 static volatile uint32_t s_idle_cnt = 0;
 static bool IRAM_ATTR idle_hook_cb(void) { s_idle_cnt++; return false; }
@@ -137,19 +139,6 @@ static void stats_task(void *arg)
 
 /* ============================================================
  * player_task
- *
- * OSD 描画順序:
- *   1. ssd1306_clear()
- *   2. ssd1306_blit_gram()   映像を g_fb に書く
- *   3. osd_layer_clear()     OSD レイヤーをクリア
- *   4. frame_osd_update()    OSD レイヤーに描画 (g_btn.osd_mask で制御)
- *      osd_draw_vol()        音量表示 (vol_show 中のみ)
- *   5. osd_layer_blit()      OSD を g_fb に INVERT 重畳
- *   6. ssd1306_flush()
- *
- * PAUSE 処理:
- *   adpcm_set_frame_ms(0) で音声 Give を停止
- *   映像は最後のフレームを保持したまま PAUSE 点滅
  * ============================================================ */
 static void player_task(void *arg)
 {
@@ -169,28 +158,27 @@ static void player_task(void *arg)
     s_ctx.buf_size = (uint16_t)sizeof(s_gram);
     if (bad_init(&s_ctx) != BAD_OK) { show_error(); }
 
-    /* ---- FPS 決定 (小数点第2位対応) ----------------------- */
+    /* ---- FPS 決定 ----------------------------------------- */
 #if defined(CFG_TARGET_FPS_100) && (CFG_TARGET_FPS_100 != 0)
     uint32_t fps_100 = (uint32_t)CFG_TARGET_FPS_100;
 #elif defined(CFG_TARGET_FPS) && (CFG_TARGET_FPS != 0)
     uint32_t fps_100 = (uint32_t)CFG_TARGET_FPS * 100U;
 #else
-    uint32_t fps_100 = 3000U;   /* デフォルト 30.00fps */
+    uint32_t fps_100 = 3000U;
 #endif
     if (fps_100 == 0U) { fps_100 = 3000U; }
 
-    /* フレーム間隔 μs: 100000000 / (fps×100) */
-    uint32_t frame_us = 100000000U / fps_100;
-    if (frame_us == 0U) { frame_us = 1U; }
-    s_frame_ms = frame_us / 1000U;
+    s_frame_us = 100000000U / fps_100;
+    if (s_frame_us == 0U) { s_frame_us = 1U; }
+    s_frame_ms = s_frame_us / 1000U;
     if (s_frame_ms == 0U) { s_frame_ms = 1U; }
 
     ESP_LOGI(TAG,"%ux%u %u frames fps=%.2f frame_us=%"PRIu32,
              s_ctx.width, s_ctx.height, s_ctx.total_frames,
-             (float)fps_100/100.0f, frame_us);
+             (float)fps_100/100.0f, s_frame_us);
 
 #if (CFG_AUDIO_ENABLE == 1)
-    adpcm_set_frame_us(frame_us);
+    adpcm_set_frame_us(s_frame_us);
 #endif
     if (s_frame_timer) {
         xTimerChangePeriod(s_frame_timer,
@@ -202,48 +190,62 @@ static void player_task(void *arg)
 
     int was_paused = 0;
 
-    /* ---- メインループ ---- */
     for (;;) {
 
-        /* ---- PAUSE 処理 ----------------------------------- */
+        /* ============================================================
+         * [Fix1] PAUSE: 音声も停止する
+         *   adpcm_set_frame_ms(0) → ISR の s_frame_interval_ms=0
+         *   → spf=0 → Give が発生しない → セマフォが積まれない
+         *   → xSemaphoreTake がブロック → 映像も停止
+         *   音声 PCM の出力 (ledc_set_duty) は最後の値で保持
+         *   (ポップノイズなし)
+         * ============================================================ */
         if (g_btn.paused) {
             if (!was_paused) {
 #if (CFG_AUDIO_ENABLE == 1)
-                adpcm_set_frame_ms(0U);   /* 音声 Give 停止 */
+                adpcm_pause();   /* gptimer 停止 → 音声完全停止 */
 #endif
-                /* 積み上がったセマフォを全て捨てる */
+                /* 積み上がったセマフォを捨てる */
                 while (xSemaphoreTake(s_video_sem, 0) == pdTRUE) {}
                 was_paused = 1;
+                ESP_LOGI(TAG,"PAUSE");
             }
             vTaskDelay(pdMS_TO_TICKS(100));
 #if (CFG_VIDEO_ENABLE == 1)
-            /* 最後の映像フレームを保持したまま PAUSE 表示 */
             ssd1306_clear();
             ssd1306_blit_gram(s_ctx.gram,
                               (int)s_ctx.width, (int)s_ctx.height);
             osd_layer_clear();
-            osd_draw_pause();   /* 中央点滅 */
+            osd_draw_pause();
             osd_layer_blit();
             ssd1306_flush();
 #endif
             continue;
         }
 
-        /* ---- 再生再開 ------------------------------------- */
         if (was_paused) {
             was_paused = 0;
 #if (CFG_AUDIO_ENABLE == 1)
-            adpcm_set_frame_us(frame_us);   /* 音声 Give 再開 */
+            adpcm_resume();   /* gptimer 再開、カウンタリセット */
 #endif
-            /* 停止中に積み上がったセマフォを捨てる */
             while (xSemaphoreTake(s_video_sem, 0) == pdTRUE) {}
+            ESP_LOGI(TAG,"RESUME");
         }
 
-        /* セマフォ待ち (フレームタイミング) */
+        /* ============================================================
+         * [Fix3] 音量を毎フレーム反映
+         *   button_get_vol() の戻り値 (0-256) を adpcm_set_vol() に渡す。
+         *   ISR が s_vol を参照するので即時反映される。
+         *   vol_step=0 のとき button_get_vol() は 0 を返す → 無音。
+         * ============================================================ */
+#if (CFG_AUDIO_ENABLE == 1)
+        adpcm_set_vol(button_get_vol());
+#endif
+
         xSemaphoreTake(s_video_sem, portMAX_DELAY);
 
 #if (CFG_VIDEO_ENABLE == 1)
-        /* フレームスキップ: 積み上がり分を1フレームだけ消化 */
+        /* フレームスキップ (最大1フレーム) */
         if (xSemaphoreTake(s_video_sem, 0) == pdTRUE) {
             bad_result_t rs = bad_next_frame(&s_ctx);
             if (rs == BAD_EOF) {
@@ -257,36 +259,36 @@ static void player_task(void *arg)
         bad_result_t r = bad_next_frame(&s_ctx);
 
         if (r == BAD_OK || r == BAD_EOF) {
-            /* 1. 映像を g_fb に書く */
             ssd1306_clear();
             ssd1306_blit_gram(s_ctx.gram,
                               (int)s_ctx.width, (int)s_ctx.height);
 
-            /* 2. OSD レイヤーをクリアして描画
-             *    g_btn.osd_mask: bit0=CPU bit1=FPS bit2=VU
-             *    初期値は config.h の CFG_OSD_CPU/FPS/VU から生成済み
-             *    0xFFFFFFFF を渡すと frame_osd_update が非表示扱い */
+            /* ============================================================
+             * [Fix2] OSD マスクを正しく適用
+             *   毎フレーム osd_layer_clear() を呼ぶ → 残像なし。
+             *   g_btn.osd_mask の各ビットで表示/非表示を制御:
+             *     bit0=CPU: 0xFFFFFFFF を渡すと非表示
+             *     bit1=FPS: 0xFFFFFFFF を渡すと非表示
+             *     bit2=VU : 0 を渡すと非表示 (バー幅=0)
+             *   osd_mask=0 のときは frame_osd_update 自体を呼ばない。
+             * ============================================================ */
             osd_layer_clear();
-            {
+
+            if (g_btn.osd_mask != 0U) {
                 uint32_t show_fps = (g_btn.osd_mask & 0x02U)
                                     ? s_fps_x10 : 0xFFFFFFFFUL;
                 uint32_t show_cpu = (g_btn.osd_mask & 0x01U)
                                     ? s_cpu_x10 : 0xFFFFFFFFUL;
                 uint16_t show_vu  = (g_btn.osd_mask & 0x04U)
                                     ? adpcm_get_vu() : 0U;
-                if (g_btn.osd_mask != 0U) {
-                    frame_osd_update(frame, show_fps, show_cpu, show_vu);
-                }
-                /* 音量バー (1.5秒間表示) */
-                if (g_btn.vol_show) {
-                    osd_draw_vol(g_btn.vol_step);
-                }
+                frame_osd_update(frame, show_fps, show_cpu, show_vu);
             }
 
-            /* 3. OSD を映像に INVERT 重畳 */
-            osd_layer_blit();
+            if (g_btn.vol_show) {
+                osd_draw_vol(g_btn.vol_step);
+            }
 
-            /* 4. OLED 転送 */
+            osd_layer_blit();
             ssd1306_flush();
             s_frame_count++;
         }
@@ -316,19 +318,15 @@ static void player_task(void *arg)
  * ============================================================ */
 void app_main(void)
 {
-    ESP_LOGI(TAG,"BadCodecPlayer v3.2.0  VIDEO=%d AUDIO=%d",
+    ESP_LOGI(TAG,"BadCodecPlayer v3.3.0  VIDEO=%d AUDIO=%d",
              CFG_VIDEO_ENABLE, CFG_AUDIO_ENABLE);
 
     s_video_sem = xSemaphoreCreateBinary();
     if (!s_video_sem) { esp_restart(); }
 
-    /* ---- ボタン初期化 -------------------------------------
-     * OSD 初期マスクは config.h の CFG_OSD_CPU/FPS/VU から生成。
-     * button_init() 内で以下を実行:
-     *   g_btn.osd_mask = (CFG_OSD_CPU?0x01:0)
-     *                  | (CFG_OSD_FPS?0x02:0)
-     *                  | (CFG_OSD_VU ?0x04:0)
-     * ------------------------------------------------------- */
+    /* ---- ボタン初期化
+     * OSD 初期マスク: config.h の CFG_OSD_CPU/FPS/VU から生成
+     * 音量初期ステップ: CFG_AUDIO_VOL から変換           ---- */
     {
         uint8_t vs = (uint8_t)(((uint32_t)CFG_AUDIO_VOL * 16U) / 256U);
         if (vs >= 16U) { vs = 15U; }
@@ -344,7 +342,9 @@ void app_main(void)
 
 #if (CFG_AUDIO_ENABLE == 1)
     if (adpcm_init(NULL, 0, s_video_sem) == 0) {
-        ESP_LOGI(TAG,"audio OK");
+        /* 初期音量を button の初期ステップから設定 */
+        adpcm_set_vol(button_get_vol());
+        ESP_LOGI(TAG,"audio OK vol=%u", button_get_vol());
     } else {
         ESP_LOGE(TAG,"audio fail: SW timer");
         start_sw_frame_timer();
